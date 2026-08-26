@@ -196,15 +196,65 @@ fn build_lock_block(locks: &[Lock]) -> String {
     s
 }
 
-/// Скільки непрочитаного лежить конкретному агенту.
+/// Три числа непрочитаного замість одного.
 ///
-/// `Both` рахується обом — рівно так само, як це робить `Store::inbox`
-/// із `unread_only`. Рахуємо на вже зібраному зрізі, щоб не ходити в базу
-/// вдруге й не залежати від того, що там міняється паралельно.
-fn unread_for(msgs: &[Message], who: Agent) -> usize {
-    msgs.iter()
-        .filter(|m| m.read_at.is_none() && (m.envelope.to == who || m.envelope.to == Agent::Both))
-        .count()
+/// Одне число нічого не означало. На живій дошці воно писало «Claude — 41»,
+/// і з тих сорока одного питань (`op = Q`) було рівно два, а решта — статуси
+/// на `Both` («w2-ok», «apk 15.74 MB»). Сорок один звучить як катастрофа,
+/// два — як робота на пʼять хвилин; саме тому лічильник почали ігнорувати.
+/// Розділяємо за тим, що вимагає дії:
+///
+/// 1. **питання без відповіді** — непрочитані `op = Q`;
+/// 2. **особисті** — непрочитані з конкретним адресатом (`to != Both`),
+///    крім уже порахованих питань;
+/// 3. **широкомовні** — решта непрочитаних (`to = Both`, `op != Q`).
+///
+/// `Both` як адресат рахується обом — рівно так само, як це робить
+/// `Store::inbox` із `unread_only`, тож питання на `Both` стоїть у черзі
+/// в обох. Через це широкомовних одне число, а не пара: такі повідомлення
+/// лежать в обох скриньках однаково, і розписувати їх «Grok — 31,
+/// Claude — 31» означало б удвічі роздути ту саму купу.
+///
+/// Рахуємо на вже зібраному зрізі, щоб не ходити в базу вдруге й не
+/// залежати від того, що там міняється паралельно.
+#[derive(Default)]
+struct Unread {
+    q_grok: usize,
+    q_claude: usize,
+    personal_grok: usize,
+    personal_claude: usize,
+    broadcast: usize,
+}
+
+impl Unread {
+    /// Черга питань порожня — рядок має сказати це спокійно, без ⚠️.
+    fn no_questions(&self) -> bool {
+        self.q_grok == 0 && self.q_claude == 0
+    }
+}
+
+fn tally_unread(msgs: &[Message]) -> Unread {
+    let mut t = Unread::default();
+    for m in msgs.iter().filter(|m| m.read_at.is_none()) {
+        let to = m.envelope.to;
+        if m.envelope.op == Op::Q {
+            // Питання перебиває адресата: `Q` на `Both` — це питання
+            // обом, а не широкомовний статус.
+            if to == Agent::Grok || to == Agent::Both {
+                t.q_grok += 1;
+            }
+            if to == Agent::Claude || to == Agent::Both {
+                t.q_claude += 1;
+            }
+            continue;
+        }
+        match to {
+            Agent::Grok => t.personal_grok += 1,
+            Agent::Claude => t.personal_claude += 1,
+            Agent::Both => t.broadcast += 1,
+        }
+    }
+    t
 }
 
 /// Позначка непрочитаного в мічених полях рядка inbox.
@@ -213,6 +263,13 @@ fn unread_for(msgs: &[Message], who: Agent) -> usize {
 /// давало голий `-`. У списку, де кожен рядок і так починається з `- `,
 /// такий дефіс читався як другий списковий маркер, а не як «немає часу».
 const UNREAD_MARK: &str = "непрочитане";
+
+/// Рядок порожньої черги питань.
+///
+/// Окремим текстом, а не «Grok — 0, Claude — 0» зі знаком тривоги: нуль
+/// питань — це нормальний стан, і виглядати він має спокійно. ⚠️ у файлі,
+/// який читають щодня, працює лише поки не стоїть там завжди.
+const NO_QUESTIONS_LINE: &str = "- питань без відповіді немає";
 
 fn op_str(op: Op) -> &'static str {
     match op {
@@ -239,11 +296,28 @@ fn build_inbox_block(msgs: &[Message]) -> String {
     s.push_str(INBOX_BEGIN);
     s.push_str("\n## Inbox\n\n");
 
+    // Порядок рядків = порядок важливості: питання першими й помітно,
+    // широкомовні останніми й тихо, одним числом у спільному рядку.
+    let t = tally_unread(msgs);
+    if t.no_questions() {
+        s.push_str(NO_QUESTIONS_LINE);
+        s.push('\n');
+    } else {
+        let _ = writeln!(
+            &mut s,
+            "- ⚠️ питань без відповіді: Grok — {}, Claude — {}",
+            t.q_grok, t.q_claude
+        );
+    }
     let _ = writeln!(
         &mut s,
-        "- непрочитаних: Grok — {}, Claude — {} (усього повідомлень {})",
-        unread_for(msgs, Agent::Grok),
-        unread_for(msgs, Agent::Claude),
+        "- особистих непрочитаних: Grok — {}, Claude — {}",
+        t.personal_grok, t.personal_claude
+    );
+    let _ = writeln!(
+        &mut s,
+        "- широкомовних: {} · усього повідомлень {}",
+        t.broadcast,
         msgs.len()
     );
 
@@ -658,7 +732,14 @@ mod tests {
         // R5: тіл повідомлень у NOW.md більше немає — лише підсумок
         // і вказівник на машинний файл.
         assert!(!text.contains("```json"), "тіло лишилось у NOW.md: {text}");
-        assert!(text.contains("непрочитаних:"));
+        assert!(text.contains("особистих непрочитаних:"));
+        // Єдине повідомлення ack-нуте, тож черга питань порожня — і рядок
+        // про це має бути спокійний.
+        assert!(
+            text.contains(NO_QUESTIONS_LINE),
+            "немає тихого рядка: {text}"
+        );
+        assert!(!text.contains('⚠'), "тривога на порожній черзі: {text}");
         // P0-R4: час прочитання йде з назвою. Повідомлення тут ack-нуте,
         // тож у рядку має стояти число, а не позначка непрочитаного.
         assert!(text.contains("read_at="), "немає мітки read_at: {text}");
@@ -1377,13 +1458,16 @@ mod tests {
         let text = fs::read_to_string(&now).unwrap();
         let block = &text[text.find(INBOX_BEGIN).unwrap()..text.find(INBOX_END).unwrap()];
 
-        // Прочитане не рахується; Both — обом.
+        // Прочитане не рахується. Єдине питання (`alpha`, Op::Q) ack-нуте,
+        // тож черга питань порожня; `beta` — особисте Grokові; `gamma` на
+        // `Both` — широкомовне, а не особисте.
+        assert!(block.contains(NO_QUESTIONS_LINE), "не тиха черга: {block}");
         assert!(
-            block.contains("Grok — 2, Claude — 1"),
-            "не ті числа непрочитаних: {block}"
+            block.contains("особистих непрочитаних: Grok — 1, Claude — 0"),
+            "не ті числа особистих: {block}"
         );
         assert!(
-            block.contains("усього повідомлень 3"),
+            block.contains("широкомовних: 1 · усього повідомлень 3"),
             "не той підсумок: {block}"
         );
         assert!(block.contains(&format!("- останнє: #{last}")), "{block}");
@@ -1399,11 +1483,167 @@ mod tests {
         // Тіл немає, і блок лишився коротким.
         assert!(!block.contains("```json"), "{block}");
         assert!(!block.contains("\"k\""), "тіло просочилось: {block}");
-        // Три рядки підсумку — і жодного «на повідомлення».
+        // Пʼять рядків підсумку (три лічильники, останнє, вказівник) —
+        // і жодного «на повідомлення».
         assert_eq!(
             block.lines().filter(|l| l.starts_with("- ")).count(),
-            3,
+            5,
             "блок inbox знову розрісся: {block}"
+        );
+    }
+
+    /// Головний випадок, заради якого лічильник розділено: три питання
+    /// й десять статусів — це «3 і 10», а не одне лячне «13».
+    #[test]
+    fn questions_and_broadcasts_are_counted_apart() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("exchange.db");
+        let now = dir.path().join("NOW.md");
+        fs::write(&now, handwritten()).unwrap();
+
+        let store = Store::open(&db).unwrap();
+        // Знімок із порожньою чергою — з ним і звірятимемо рукопис.
+        render(&store, &now).unwrap();
+        let first = fs::read_to_string(&now).unwrap();
+
+        // Питання йдуть на `Both` — саме так їх і ставлять на дошці.
+        for i in 0..3 {
+            store
+                .post(sample_envelope(
+                    Agent::Claude,
+                    Agent::Both,
+                    &format!("q{i}"),
+                    Op::Q,
+                ))
+                .unwrap();
+        }
+        for i in 0..10 {
+            store
+                .post(sample_envelope(
+                    Agent::Claude,
+                    Agent::Both,
+                    &format!("w{i}-ok"),
+                    Op::N,
+                ))
+                .unwrap();
+        }
+
+        render(&store, &now).unwrap();
+        let text = fs::read_to_string(&now).unwrap();
+        let block = &text[text.find(INBOX_BEGIN).unwrap()..text.find(INBOX_END).unwrap()];
+
+        // `Q` на `Both` — питання обом, а не широкомовне.
+        assert!(
+            block.contains("⚠️ питань без відповіді: Grok — 3, Claude — 3"),
+            "питання загубились: {block}"
+        );
+        assert!(
+            block.contains("широкомовних: 10 · усього повідомлень 13"),
+            "13 замість 3 і 10: {block}"
+        );
+        // `Both` ніколи не особисте.
+        assert!(
+            block.contains("особистих непрочитаних: Grok — 0, Claude — 0"),
+            "Both порахувалось особистим: {block}"
+        );
+        assert!(!block.contains(NO_QUESTIONS_LINE), "{block}");
+
+        // Питання стоїть вище за широкомовні.
+        let q = block.find("питань без відповіді").unwrap();
+        let b = block.find("широкомовних:").unwrap();
+        assert!(q < b, "широкомовні перебили питання: {block}");
+
+        // Рукопис поза блоками — байт у байт.
+        assert_eq!(
+            outside_blocks(&first),
+            outside_blocks(&text),
+            "лічильник зачепив текст поза парою"
+        );
+        assert!(text.contains("тримаємо курс на маркери"), "{text}");
+    }
+
+    /// Особисте — це конкретний адресат; `Both` без `Q` — широкомовне.
+    #[test]
+    fn personal_counts_only_named_recipient() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("exchange.db");
+        let now = dir.path().join("NOW.md");
+        fs::write(&now, handwritten()).unwrap();
+
+        let store = Store::open(&db).unwrap();
+        store
+            .post(sample_envelope(
+                Agent::Claude,
+                Agent::Grok,
+                "особисте",
+                Op::N,
+            ))
+            .unwrap();
+        store
+            .post(sample_envelope(Agent::Grok, Agent::Claude, "теж", Op::A))
+            .unwrap();
+        store
+            .post(sample_envelope(
+                Agent::Grok,
+                Agent::Both,
+                "apk 15.74 MB",
+                Op::N,
+            ))
+            .unwrap();
+
+        render(&store, &now).unwrap();
+        let text = fs::read_to_string(&now).unwrap();
+        let block = &text[text.find(INBOX_BEGIN).unwrap()..text.find(INBOX_END).unwrap()];
+
+        assert!(
+            block.contains("особистих непрочитаних: Grok — 1, Claude — 1"),
+            "не ті числа особистих: {block}"
+        );
+        assert!(
+            block.contains("широкомовних: 1 · усього повідомлень 3"),
+            "Both не порахувалось широкомовним: {block}"
+        );
+    }
+
+    /// Порожня черга питань не сміє виглядати тривогою.
+    #[test]
+    fn zero_questions_reads_calm() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("exchange.db");
+        let now = dir.path().join("NOW.md");
+        fs::write(&now, handwritten()).unwrap();
+
+        let store = Store::open(&db).unwrap();
+        for i in 0..5 {
+            store
+                .post(sample_envelope(
+                    Agent::Grok,
+                    Agent::Both,
+                    &format!("uniffi-ok {i}"),
+                    Op::N,
+                ))
+                .unwrap();
+        }
+        // Ack-нуте питання теж не має піднімати тривогу.
+        let answered = store
+            .post(sample_envelope(
+                Agent::Claude,
+                Agent::Grok,
+                "закрите",
+                Op::Q,
+            ))
+            .unwrap();
+        store.ack(answered).unwrap();
+
+        render(&store, &now).unwrap();
+        let text = fs::read_to_string(&now).unwrap();
+        let block = &text[text.find(INBOX_BEGIN).unwrap()..text.find(INBOX_END).unwrap()];
+
+        assert!(block.contains(NO_QUESTIONS_LINE), "не тихий рядок: {block}");
+        assert!(!block.contains('⚠'), "тривога на нулі питань: {block}");
+        assert!(
+            !block.contains("питань без відповіді: Grok"),
+            "нулі розписані числами: {block}"
         );
     }
 
@@ -1427,10 +1667,14 @@ mod tests {
         let text = fs::read_to_string(&now).unwrap();
         let block = &text[text.find(INBOX_BEGIN).unwrap()..text.find(INBOX_END).unwrap()];
         assert!(
-            block.contains("Grok — 0, Claude — 0"),
+            block.contains("особистих непрочитаних: Grok — 0, Claude — 0"),
             "немає нулів: {block}"
         );
-        assert!(block.contains("усього повідомлень 0"), "{block}");
+        assert!(block.contains(NO_QUESTIONS_LINE), "{block}");
+        assert!(
+            block.contains("широкомовних: 0 · усього повідомлень 0"),
+            "{block}"
+        );
         assert!(block.contains("- (немає)"), "{block}");
     }
 

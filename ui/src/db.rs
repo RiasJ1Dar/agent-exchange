@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags};
 
-use crate::page::{LockView, MessageView, Snapshot};
+use crate::page::{classify_unread, LockView, MessageView, Snapshot, UnreadKind};
 
 /// База обміну за замовчуванням, коли `EXCHANGE_DB` не задано.
 pub const DEFAULT_DB: &str = r"C:\Users\Public\agent-board\exchange.db";
@@ -33,7 +33,11 @@ pub const MESSAGE_LIMIT: usize = 50;
 ///
 /// ⚠️ Рядок, а не enum: у базі це TEXT, і саме так його порівнює
 /// `Store::inbox` (`to_agent = ?1 OR to_agent = 'Both'`).
-pub const BOTH: &str = "Both";
+///
+/// Визначення одне на крейт і живе в `page` — розряди непрочитаних
+/// відрізняються саме за цим рядком, і два його написання рано чи пізно
+/// розійшлися б.
+pub const BOTH: &str = crate::page::BOTH;
 
 /// Агенти, для яких рахуються непрочитані.
 pub const GROK: &str = "Grok";
@@ -264,6 +268,48 @@ fn count_unread(conn: &Connection, path: &Path, agent: &str) -> Result<usize, Db
     Ok(n.max(0) as usize)
 }
 
+/// Три розряди непрочитаних: питання, адресні, широкомовні.
+///
+/// ⚠️ Рахується по **всій** таблиці, а не по тих 50 рядках, що показані:
+/// лічильник, який мовчить про непрочитане поза видимим вікном, гірший за
+/// відсутній.
+///
+/// Класифікація навмисне **не** в SQL: правило «що є питанням» одне на крейт
+/// і живе в [`classify_unread`], перевірене без бази. SQL тут робить лише те,
+/// що вміє краще — згортає таблицю до кількох рядків `(to_agent, op, скільки)`,
+/// тож обсяг журналу на роботу не впливає.
+fn count_unread_split(conn: &Connection, path: &Path) -> Result<(usize, usize, usize), DbError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT to_agent, op, count(*)
+             FROM messages
+             WHERE read_at IS NULL
+             GROUP BY to_agent, op",
+        )
+        .map_err(|e| classify(e, path, true))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|e| classify(e, path, true))?;
+
+    let (mut questions, mut personal, mut broadcast) = (0usize, 0usize, 0usize);
+    for row in rows {
+        let (to, op, n) = row.map_err(|e| classify(e, path, true))?;
+        let n = n.max(0) as usize;
+        match classify_unread(&to, &op) {
+            UnreadKind::Question => questions += n,
+            UnreadKind::Personal => personal += n,
+            UnreadKind::Broadcast => broadcast += n,
+        }
+    }
+    Ok((questions, personal, broadcast))
+}
+
 /// mtime файла в unix-секундах. `None`, якщо файла немає або час недоступний.
 ///
 /// ⚠️ Читається лише `metadata` — сам файл не відкривається. `NOW.md` пише
@@ -322,10 +368,15 @@ pub fn read_snapshot(db: &Path, now: i64, now_md: &Path) -> Result<Snapshot, DbE
         }
     }
 
+    let (questions, personal, broadcast) = count_unread_split(&conn, db)?;
+
     Ok(Snapshot {
         now,
         locks: read_locks(&conn, db)?,
         messages: read_messages(&conn, db)?,
+        unread_questions: questions,
+        unread_personal: personal,
+        unread_broadcast: broadcast,
         unread_grok: count_unread(&conn, db, GROK)?,
         unread_claude: count_unread(&conn, db, CLAUDE)?,
         last_render: file_mtime_unix(now_md),
@@ -463,6 +514,9 @@ mod tests {
         assert!(snap.messages.is_empty());
         assert_eq!(snap.unread_grok, 0);
         assert_eq!(snap.unread_claude, 0);
+        assert_eq!(snap.unread_questions, 0);
+        assert_eq!(snap.unread_personal, 0);
+        assert_eq!(snap.unread_broadcast, 0);
         assert_eq!(snap.last_render, None);
     }
 
@@ -521,6 +575,70 @@ mod tests {
         // Grok: одне персональне + те саме Both.
         assert_eq!(snap.unread_grok, 2);
         assert_eq!(snap.messages.len(), 5);
+        // ⚠️ А в розрядах те саме Both рахується рівно раз: два адресні
+        // «N» + одне широкомовне.
+        assert_eq!(snap.unread_personal, 2);
+        assert_eq!(snap.unread_broadcast, 1);
+        assert_eq!(snap.unread_questions, 0);
+    }
+
+    /// Живий випадок: одне число «41» проти трьох чесних.
+    #[test]
+    fn unread_splits_into_questions_personal_and_broadcast() {
+        let dir = TmpDir::new("split");
+        let db = make_db(&dir);
+        {
+            let w = writer(&db);
+            // Три питання, зокрема одне широкомовне — воно теж питання.
+            insert_msg(&w, 1, "Grok", "Claude", "t", "Q", None);
+            insert_msg(&w, 2, "Claude", "Grok", "t", "Q", None);
+            insert_msg(&w, 3, "Grok", BOTH, "t", "Q", None);
+            // Вісім адресних не-питань.
+            for n in 0..8 {
+                let op = if n % 2 == 0 { "N" } else { "A" };
+                insert_msg(&w, 100 + n, "Grok", "Claude", "t", op, None);
+            }
+            // Тридцять широкомовних статусів на Both.
+            for n in 0..30 {
+                insert_msg(&w, 200 + n, "Grok", BOTH, "w2-ok", "N", None);
+            }
+            // Прочитане не рахується в жодному розряді.
+            insert_msg(&w, 900, "Grok", "Claude", "t", "Q", Some(901));
+            insert_msg(&w, 902, "Grok", BOTH, "t", "N", Some(903));
+        }
+        let snap = read_snapshot(&db, 1_000, &dir.join("NOW.md")).expect("снапшот");
+        assert_eq!(snap.unread_questions, 3);
+        assert_eq!(snap.unread_personal, 8);
+        assert_eq!(snap.unread_broadcast, 30);
+        assert_eq!(snap.unread_total(), 41);
+
+        // Сторінка мусить показати саме три числа, а не 41 одним.
+        let html = crate::page::render_page(&snap);
+        assert!(html.contains("<span class=\"qnum\">3</span>"), "{html}");
+        assert!(html.contains("Особистих без ack: <span class=\"unread\">8</span>"), "{html}");
+        assert!(html.contains("Широкомовних без ack: 30"), "{html}");
+    }
+
+    /// Розрядів більше, ніж показаних рядків: лічильник рахує всю таблицю.
+    #[test]
+    fn split_counts_beyond_the_shown_message_limit() {
+        let dir = TmpDir::new("beyond");
+        let db = make_db(&dir);
+        let extra = MESSAGE_LIMIT as i64 + 10;
+        {
+            let w = writer(&db);
+            // Найстаріше — питання; у вибірку з 50 найновіших воно не влізе.
+            insert_msg(&w, 1, "Grok", "Claude", "давнє", "Q", None);
+            for n in 0..extra {
+                insert_msg(&w, 100 + n, "Grok", BOTH, "шум", "N", None);
+            }
+        }
+        let snap = read_snapshot(&db, 9_999, &dir.join("NOW.md")).expect("снапшот");
+        assert_eq!(snap.messages.len(), MESSAGE_LIMIT);
+        assert!(!snap.messages.iter().any(|m| m.op == "Q"), "питання поза вікном");
+        // Але лічильник його бачить.
+        assert_eq!(snap.unread_questions, 1);
+        assert_eq!(snap.unread_broadcast, extra as usize);
     }
 
     #[test]

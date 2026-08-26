@@ -2,7 +2,7 @@
 //! JSON. Кадрування визначається для кожного запиту окремо, відповідь іде
 //! тим самим кадруванням. Прод-БД: agent-board/exchange.db.
 
-use exchange_store::{Agent, Envelope, Lock, Store};
+use exchange_store::{Agent, Envelope, InboxQuery, Lock, Store};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -43,6 +43,18 @@ pub const AGENT_NAME_ENV: &str = "AGENT_NAME";
 /// Значення, які приймає [`AGENT_NAME_ENV`]. `Both` не є особистістю:
 /// це адреса розсилки, ним не підписуються і замків він не тримає.
 const ENV_AGENT_NAMES: &[&str] = &["Grok", "Claude"];
+
+/// Скільки символів тіла віддавати, коли агент розгрібає чергу
+/// (`inbox` з `unread_only = true`) і сам стелі не назвав.
+///
+/// ⚠️ Стеля стоїть **саме тут, на межі MCP**, а не в `store`. Причина проста:
+/// `render` кличе `store.inbox` напряму й малює з нього NOW.md для людини —
+/// постав дефолт у `store`, і дошка мовчки почала б писати обрізані тіла,
+/// виглядаючи при цьому повною. Обрізання потрібне рівно одному викликачеві —
+/// агентові, що читає сорок непрочитаних, — тож тут воно і живе.
+///
+/// Явний `brief` перебиває дефолт; `brief = 0` або `null` — повні тіла.
+pub const DEFAULT_BRIEF_CHARS: usize = 200;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -139,15 +151,21 @@ impl Mcp {
                     .get("unread_only")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let messages = self.store.inbox(agent, unread_only)?;
+                let query = InboxQuery {
+                    agent,
+                    unread_only,
+                    limit: opt_usize(args, "limit")?,
+                    brief: resolve_brief(args, unread_only)?,
+                    topic: opt_string(args, "topic")?,
+                    // `exclude_own` навмисне не виставляється з MCP: агент
+                    // бачить власні розсилки `to = Both` у себе ж, і тихо
+                    // ховати їх означало б міняти склад скриньки без прохання.
+                    ..InboxQuery::default()
+                };
+                let messages = self.store.inbox_ex(query)?;
                 Ok(tool_ok(json!({ "messages": messages })))
             }
-            "ack" => {
-                let id = json_i64(args, "id")?;
-                self.store.ack(id)?;
-                self.rerender()?;
-                Ok(tool_ok(json!({ "ok": true, "id": id })))
-            }
+            "ack" => self.ack_tool(args, agent_env),
             "lock" => {
                 let topic = json_str(args, "topic")?;
                 let holder = resolve_agent(args, "holder", agent_env)?;
@@ -185,6 +203,59 @@ impl Mcp {
                 Ok(tool_ok(locks_payload(&locks, now_unix())?))
             }
             other => Ok(tool_err(format!("невідомий tool: {other}"))),
+        }
+    }
+
+    /// `ack` двома шляхами: один `id` або пачка `ids`.
+    ///
+    /// Розвʼязуються вони **до** будь-якої роботи зі сховищем і за наявністю
+    /// поля, а не за його значенням: обидва разом — помилка (мовчки віддати
+    /// перевагу одному означало б тихо проігнорувати половину прохання),
+    /// жодного — теж помилка. Далі шляхи не змішуються:
+    ///
+    /// * `id` лишається як був — [`Store::ack`], без агента, `NotFound`
+    ///   на невідомий id. Наявні виклики проходять байт-у-байт;
+    /// * `ids` іде через [`Store::ack_many`] і **потребує особистості**:
+    ///   пачка позначає лише те, що адресоване цьому агентові. Чужі,
+    ///   неіснуючі та вже прочитані просто не рахуються — це відповідь,
+    ///   а не збій, тому у відповіді видно і `acked`, і `requested`.
+    fn ack_tool(&self, args: &Value, agent_env: Option<&str>) -> Result<Value, Error> {
+        let has_id = has_value(args, "id");
+        let has_ids = has_value(args, "ids");
+        match (has_id, has_ids) {
+            (true, true) => Err(Error::InvalidParams(
+                "разом `id` і `ids` не приймаються: або один id, або пачка ids"
+                    .into(),
+            )),
+            (false, false) => Err(Error::InvalidParams(
+                "немає ні `id`, ні `ids`: передайте один id або масив ids".into(),
+            )),
+            (true, false) => {
+                let id = json_i64(args, "id")?;
+                self.store.ack(id)?;
+                self.rerender()?;
+                Ok(tool_ok(json!({ "ok": true, "id": id })))
+            }
+            (false, true) => {
+                let ids = json_i64_array(args, "ids")?;
+                let agent = resolve_agent(args, "agent", agent_env)?;
+                if matches!(agent, Agent::Both) {
+                    return Err(Error::InvalidParams(
+                        "agent=Both не підтверджує читання: Both — адреса розсилки, \
+                         а не особистість; передайте Grok або Claude"
+                            .into(),
+                    ));
+                }
+                let acked = self.store.ack_many(&ids, agent)?;
+                self.rerender()?;
+                Ok(tool_ok(json!({
+                    "ok": true,
+                    "agent": agent,
+                    "acked": acked,
+                    "requested": ids.len(),
+                    "ids": ids
+                })))
+            }
         }
     }
 }
@@ -579,6 +650,72 @@ fn json_i64(args: &Value, field: &str) -> Result<i64, Error> {
         .ok_or_else(|| Error::InvalidParams(format!("{field} має бути цілим")))
 }
 
+/// Чи поле справді щось несе. `null` — те саме, що відсутнє: клієнти
+/// охоче підставляють його замість пропуску, і рахувати таке за «поле задано»
+/// означало б падати на порожньому місці.
+fn has_value(args: &Value, field: &str) -> bool {
+    matches!(args.get(field), Some(v) if !v.is_null())
+}
+
+fn json_i64_array(args: &Value, field: &str) -> Result<Vec<i64>, Error> {
+    let arr = args
+        .get(field)
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| Error::InvalidParams(format!("{field} має бути масивом цілих")))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        out.push(
+            v.as_i64()
+                .ok_or_else(|| Error::InvalidParams(format!("{field}[{i}] має бути цілим")))?,
+        );
+    }
+    Ok(out)
+}
+
+/// Необовʼязкове невідʼємне число. Відсутнє або `null` — `None`;
+/// відʼємне — помилка, а не мовчазний нуль.
+fn opt_usize(args: &Value, field: &str) -> Result<Option<usize>, Error> {
+    match args.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => {
+            let n = v
+                .as_i64()
+                .ok_or_else(|| Error::InvalidParams(format!("{field} має бути цілим")))?;
+            if n < 0 {
+                return Err(Error::InvalidParams(format!(
+                    "{field} не може бути відʼємним, отримано {n}"
+                )));
+            }
+            Ok(Some(n as usize))
+        }
+    }
+}
+
+fn opt_string(args: &Value, field: &str) -> Result<Option<String>, Error> {
+    match args.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(|s| Some(s.to_string()))
+            .ok_or_else(|| Error::InvalidParams(format!("{field} має бути рядком"))),
+    }
+}
+
+/// Стеля тіла для `inbox` — див. [`DEFAULT_BRIEF_CHARS`].
+///
+/// Поле відсутнє — дефолт вмикається **тільки** при `unread_only`: агент
+/// розгрібає чергу і йому потрібні заголовки, а не сорок повних тіл.
+/// Явний `brief` завжди виграє, `brief = 0` і `brief = null` означають
+/// «повне тіло» (у `store` `Some(0)` різало б усе до самої позначки —
+/// відповіді з одних «…» ніхто не просив).
+fn resolve_brief(args: &Value, unread_only: bool) -> Result<Option<usize>, Error> {
+    match args.get("brief") {
+        None => Ok(unread_only.then_some(DEFAULT_BRIEF_CHARS)),
+        Some(Value::Null) => Ok(None),
+        Some(_) => Ok(opt_usize(args, "brief")?.filter(|n| *n > 0)),
+    }
+}
+
 fn tool_ok(value: Value) -> Value {
     json!({
         "content": [{ "type": "text", "text": value.to_string() }],
@@ -640,24 +777,28 @@ fn tool_defs() -> Value {
         },
         {
             "name": "inbox",
-            "description": "Прочитати inbox агента (unread_only за замовчуванням false)",
+            "description": "Прочитати inbox агента: unread_only (за замовчуванням false), limit (стільки найновіших), topic (фільтр за темою), brief (стеля символів тіла; при unread_only за замовчуванням 200, brief=0 — повні тіла)",
             "inputSchema": {
                 "type": "object",
                 "required": ["agent"],
                 "properties": {
                     "agent": { "type": "string", "enum": ["Grok", "Claude", "Both"] },
-                    "unread_only": { "type": "boolean" }
+                    "unread_only": { "type": "boolean" },
+                    "limit": { "type": "integer", "minimum": 0 },
+                    "brief": { "type": "integer", "minimum": 0 },
+                    "topic": { "type": "string" }
                 }
             }
         },
         {
             "name": "ack",
-            "description": "Позначити повідомлення прочитаним і перемалювати NOW.md",
+            "description": "Позначити прочитаним і перемалювати NOW.md: або один `id`, або пачка `ids` від імені `agent` (без `agent` він береться зі змінної середовища AGENT_NAME); у відповіді на пачку acked проти requested — чужі, неіснуючі та вже прочитані не рахуються й помилкою не є",
             "inputSchema": {
                 "type": "object",
-                "required": ["id"],
                 "properties": {
-                    "id": { "type": "integer" }
+                    "id": { "type": "integer" },
+                    "ids": { "type": "array", "items": { "type": "integer" } },
+                    "agent": { "type": "string", "enum": ["Grok", "Claude"] }
                 }
             }
         },
@@ -1554,5 +1695,240 @@ mod tests {
         let now_text = fs::read_to_string(&now_path).unwrap();
         assert!(now_text.starts_with("# Зараз\n"), "{now_text}");
         assert!(now_text.contains(&format!("#{id}")), "{now_text}");
+    }
+
+    // ——— пачковий ack і фільтри inbox ———
+
+    /// Покласти повідомлення й віддати його id. `rpc_id` — щоб виклики
+    /// у тесті не зливались в один.
+    fn post_msg(mcp: &Mcp, rpc_id: i64, from: &str, to: &str, topic: &str, body: Value) -> i64 {
+        let posted = call(
+            mcp,
+            rpc_id,
+            "post",
+            json!({ "from": from, "to": to, "topic": topic, "op": "N", "body": body }),
+        );
+        assert!(!is_error(&posted), "{posted}");
+        tool_json(&posted)["id"].as_i64().unwrap()
+    }
+
+    fn inbox_msgs(mcp: &Mcp, rpc_id: i64, args: Value) -> Vec<Value> {
+        let resp = call(mcp, rpc_id, "inbox", args);
+        assert!(!is_error(&resp), "{resp}");
+        tool_json(&resp)["messages"].as_array().unwrap().clone()
+    }
+
+    /// Пачка не падає через сторонні id: рахується тільки те, що агент
+    /// справді мав право підтвердити, і в відповіді видно обидва числа.
+    #[test]
+    fn ack_ids_counts_only_own_and_reports_requested() {
+        let (_dir, mcp) = tmp_mcp();
+
+        let mine = post_msg(&mcp, 1, "Grok", "Claude", "своє", json!({ "q": "ping" }));
+        let foreign = post_msg(&mcp, 2, "Claude", "Grok", "чуже", json!({ "q": "ping" }));
+
+        let resp = call(
+            &mcp,
+            3,
+            "ack",
+            json!({ "ids": [mine, foreign, 999_999], "agent": "Claude" }),
+        );
+        assert!(!is_error(&resp), "{resp}");
+        let out = tool_json(&resp);
+        assert_eq!(out["acked"], 1, "{out}");
+        assert_eq!(out["requested"], 3, "{out}");
+        assert_eq!(out["agent"], "Claude");
+
+        // Своє прочитане, чуже — ні.
+        assert!(
+            inbox_msgs(&mcp, 4, json!({ "agent": "Claude", "unread_only": true })).is_empty()
+        );
+        let grok = inbox_msgs(&mcp, 5, json!({ "agent": "Grok", "unread_only": true }));
+        assert_eq!(grok.len(), 1);
+        assert_eq!(grok[0]["id"], foreign);
+
+        // Повторна пачка тим самим складом — нуль, і знову не помилка.
+        let again = call(
+            &mcp,
+            6,
+            "ack",
+            json!({ "ids": [mine, foreign, 999_999], "agent": "Claude" }),
+        );
+        assert!(!is_error(&again), "{again}");
+        assert_eq!(tool_json(&again)["acked"], 0);
+    }
+
+    #[test]
+    fn ack_id_and_ids_together_is_error() {
+        let (_dir, mcp) = tmp_mcp();
+        let id = post_msg(&mcp, 1, "Grok", "Claude", "тема", json!({ "q": "ping" }));
+
+        let resp = call(
+            &mcp,
+            2,
+            "ack",
+            json!({ "id": id, "ids": [id], "agent": "Claude" }),
+        );
+        assert!(is_error(&resp), "{resp}");
+        let text = tool_text(&resp);
+        assert!(text.contains("id") && text.contains("ids"), "{text}");
+
+        // Помилка розбору — сховище не чіпалось.
+        let unread = inbox_msgs(&mcp, 3, json!({ "agent": "Claude", "unread_only": true }));
+        assert_eq!(unread.len(), 1, "повідомлення мало лишитись непрочитаним");
+    }
+
+    #[test]
+    fn ack_ids_rejects_both_as_agent() {
+        let (_dir, mcp) = tmp_mcp();
+        let id = post_msg(&mcp, 1, "Grok", "Both", "тема", json!({ "q": "ping" }));
+
+        let resp = call(&mcp, 2, "ack", json!({ "ids": [id], "agent": "Both" }));
+        assert!(is_error(&resp), "{resp}");
+        assert!(tool_text(&resp).contains("Both"), "{}", tool_text(&resp));
+    }
+
+    #[test]
+    fn ack_empty_ids_is_zero_not_error() {
+        let (_dir, mcp) = tmp_mcp();
+        let resp = call(&mcp, 1, "ack", json!({ "ids": [], "agent": "Claude" }));
+        assert!(!is_error(&resp), "{resp}");
+        assert_eq!(tool_json(&resp)["acked"], 0);
+        assert_eq!(tool_json(&resp)["requested"], 0);
+    }
+
+    /// Довге тіло — щоб стеля `brief` було на чому побачити.
+    fn long_body() -> Value {
+        json!({ "text": "я".repeat(600) })
+    }
+
+    #[test]
+    fn inbox_unread_only_briefs_bodies_by_default() {
+        let (_dir, mcp) = tmp_mcp();
+        post_msg(&mcp, 1, "Grok", "Claude", "тема", long_body());
+
+        let msgs = inbox_msgs(&mcp, 2, json!({ "agent": "Claude", "unread_only": true }));
+        assert_eq!(msgs.len(), 1);
+        let body = msgs[0]["envelope"]["body"].as_str().unwrap_or_else(|| {
+            panic!("обрізане тіло має бути рядком: {}", msgs[0]["envelope"]["body"])
+        });
+        assert!(body.ends_with('…'), "позначка обрізання має бути видимою: {body}");
+        assert_eq!(
+            body.chars().count(),
+            DEFAULT_BRIEF_CHARS + 1,
+            "стеля {DEFAULT_BRIEF_CHARS} плюс позначка"
+        );
+    }
+
+    /// Дефолт вмикається **тільки** на розгрібанні черги: звичайний перегляд
+    /// скриньки віддає тіла цілими, як і `render` для дошки.
+    #[test]
+    fn inbox_without_unread_only_is_not_briefed() {
+        let (_dir, mcp) = tmp_mcp();
+        post_msg(&mcp, 1, "Grok", "Claude", "тема", long_body());
+
+        let msgs = inbox_msgs(&mcp, 2, json!({ "agent": "Claude" }));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["envelope"]["body"], long_body());
+    }
+
+    #[test]
+    fn inbox_brief_zero_gives_full_bodies() {
+        let (_dir, mcp) = tmp_mcp();
+        post_msg(&mcp, 1, "Grok", "Claude", "тема", long_body());
+
+        let msgs = inbox_msgs(
+            &mcp,
+            2,
+            json!({ "agent": "Claude", "unread_only": true, "brief": 0 }),
+        );
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["envelope"]["body"], long_body());
+
+        // Явний null — те саме «повне тіло».
+        let msgs = inbox_msgs(
+            &mcp,
+            3,
+            json!({ "agent": "Claude", "unread_only": true, "brief": null }),
+        );
+        assert_eq!(msgs[0]["envelope"]["body"], long_body());
+    }
+
+    #[test]
+    fn inbox_explicit_brief_wins_over_default() {
+        let (_dir, mcp) = tmp_mcp();
+        post_msg(&mcp, 1, "Grok", "Claude", "тема", long_body());
+
+        let msgs = inbox_msgs(
+            &mcp,
+            2,
+            json!({ "agent": "Claude", "unread_only": true, "brief": 10 }),
+        );
+        let body = msgs[0]["envelope"]["body"].as_str().unwrap();
+        assert_eq!(body.chars().count(), 11, "10 символів плюс позначка: {body}");
+    }
+
+    #[test]
+    fn inbox_limit_returns_newest() {
+        let (_dir, mcp) = tmp_mcp();
+        let a = post_msg(&mcp, 1, "Grok", "Claude", "тема", json!({ "n": 1 }));
+        let b = post_msg(&mcp, 2, "Grok", "Claude", "тема", json!({ "n": 2 }));
+        let c = post_msg(&mcp, 3, "Grok", "Claude", "тема", json!({ "n": 3 }));
+
+        let msgs = inbox_msgs(&mcp, 4, json!({ "agent": "Claude", "limit": 2 }));
+        let ids: Vec<i64> = msgs.iter().map(|m| m["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![b, c], "мали прийти два найновіші, а не {a}…");
+    }
+
+    #[test]
+    fn inbox_filters_by_topic() {
+        let (_dir, mcp) = tmp_mcp();
+        let core = post_msg(&mcp, 1, "Grok", "Claude", "xvid/core", json!({ "n": 1 }));
+        post_msg(&mcp, 2, "Grok", "Claude", "xvid/ui", json!({ "n": 2 }));
+
+        let msgs = inbox_msgs(&mcp, 3, json!({ "agent": "Claude", "topic": "xvid/core" }));
+        let ids: Vec<i64> = msgs.iter().map(|m| m["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![core]);
+
+        // Нормалізація теми — робота store; тут перевіряємо, що фільтр
+        // доходить до неї, а не з'їдається на межі MCP.
+        let msgs = inbox_msgs(&mcp, 4, json!({ "agent": "Claude", "topic": "XVID/CORE" }));
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+
+        let msgs = inbox_msgs(&mcp, 5, json!({ "agent": "Claude", "topic": "нема" }));
+        assert!(msgs.is_empty(), "{msgs:?}");
+    }
+
+    #[test]
+    fn inbox_rejects_negative_limit() {
+        let (_dir, mcp) = tmp_mcp();
+        let resp = call(&mcp, 1, "inbox", json!({ "agent": "Claude", "limit": -1 }));
+        assert!(is_error(&resp), "{resp}");
+    }
+
+    /// Схеми розширились, кількість інструментів — ні: кожен зайвий tool
+    /// висить у контексті агента щосесії.
+    #[test]
+    fn tool_defs_stay_seven_and_single_line() {
+        let defs = tool_defs();
+        let arr = defs.as_array().unwrap();
+        assert_eq!(arr.len(), 7, "інструментів має лишатись сім");
+        for t in arr {
+            let name = t["name"].as_str().unwrap();
+            let desc = t["description"].as_str().unwrap();
+            assert!(!desc.contains('\n'), "опис {name} має бути однорядковим");
+        }
+        let ack = arr.iter().find(|t| t["name"] == "ack").unwrap();
+        let props = &ack["inputSchema"]["properties"];
+        assert!(props["ids"].is_object() && props["agent"].is_object(), "{ack}");
+        assert!(
+            ack["inputSchema"].get("required").is_none(),
+            "ack більше не вимагає id: приймається або id, або ids"
+        );
+        let inbox = arr.iter().find(|t| t["name"] == "inbox").unwrap();
+        let props = &inbox["inputSchema"]["properties"];
+        for f in ["unread_only", "limit", "brief", "topic"] {
+            assert!(props[f].is_object(), "немає {f} у схемі inbox: {inbox}");
+        }
     }
 }
