@@ -1,0 +1,20 @@
+[package]
+name = "exchange-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "stdio MCP: post inbox ack lock unlock render"
+
+[[bin]]
+name = "exchange-mcp"
+path = "src/main.rs"
+
+[dependencies]
+exchange-store = { path = "../store" }
+exchange-render = { path = "../render" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
