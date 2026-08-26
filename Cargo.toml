@@ -1,5 +1,5 @@
 [workspace]
-members = ["store", "render", "mcp"]
+members = ["store", "render", "mcp", "ui"]
 resolver = "2"
 
 [workspace.package]

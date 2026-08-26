@@ -1,0 +1,26 @@
+[package]
+name = "exchange-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Окремий переглядач стану обміну: читає базу лише на читання"
+
+[lib]
+name = "exchange_ui"
+path = "src/lib.rs"
+
+# HTTP лишається написаним на `std`: мережа для `cargo` тут не гарантована,
+# а незібраний крейт зупиняє роботу другого агента. Єдина не-std залежність
+# нижче — `rusqlite`, і вона вже є у workspace.
+# Бінарник, який запускає людина. Окремо від `[lib]`, бо крейт лишається
+# бібліотекою: `page` і `http` треба перевіряти тестами без запуску процесу.
+[[bin]]
+name = "exchange-ui"
+path = "src/main.rs"
+
+[dependencies]
+thiserror.workspace = true
+# ⚠️ Підключення наявної workspace-залежності, а не нова: `rusqlite` уже тягне
+# `store`. Потрібна тут лише щоб відкрити базу **на читання**; жодного
+# запису в цьому крейті немає.
+rusqlite.workspace = true
