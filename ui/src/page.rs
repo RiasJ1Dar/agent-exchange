@@ -75,6 +75,51 @@ pub struct MessageView {
     pub read: bool,
 }
 
+/// Значення `to`, яке означає «обом». Єдине місце, де цей рядок записаний.
+///
+/// ⚠️ Рядок, а не enum: у базі це TEXT, і сторінка мусить пережити будь-яке
+/// значення, зокрема невідоме їй.
+pub const BOTH: &str = "Both";
+
+/// Операція «питання». Рівно `Q`, без нормалізації регістру: `store` пише
+/// саме ці чотири літери (`Q`, `A`, `N`, `L`) і відкидає решту ще на вході,
+/// тож «а раптом прийде `q`» — вигаданий випадок, а тиха толерантність до
+/// нього приховала б справжню розбіжність зі схемою.
+pub const OP_QUESTION: &str = "Q";
+
+/// Куди зарахувати одне непрочитане повідомлення.
+///
+/// Розряди **взаємовиключні** й перекривають усе: кожне непрочитане потрапляє
+/// рівно в один. Тому три числа складаються в загальну кількість, і жодне
+/// повідомлення не зникає й не рахується двічі.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnreadKind {
+    /// `op = Q` — питання, на яке ще ніхто не відповів. Кому адресоване,
+    /// значення не має: питання «обом» — теж питання.
+    Question,
+    /// Адресне (`to != Both`), але не питання: статус чи нотатка особисто
+    /// тобі. Прочитати варто, відповідати не обов'язково.
+    Personal,
+    /// `to = Both` і не питання — широкомовне «до відома».
+    Broadcast,
+}
+
+/// Розкласти непрочитане за сенсом.
+///
+/// ⚠️ Порядок перевірок не випадковий: `op = Q` вирішує **першим**. Питання,
+/// надіслане на `Both`, лишається питанням — саме воно чекає на відповідь,
+/// і сховати його серед широкомовних означало б повернути ту саму сліпоту,
+/// заради якої лічильник і розділили.
+pub fn classify_unread(to: &str, op: &str) -> UnreadKind {
+    if op == OP_QUESTION {
+        UnreadKind::Question
+    } else if to != BOTH {
+        UnreadKind::Personal
+    } else {
+        UnreadKind::Broadcast
+    }
+}
+
 /// Усе, що потрібно сторінці. Складає його наступний зріз, читаючи базу.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Snapshot {
@@ -85,12 +130,31 @@ pub struct Snapshot {
     pub locks: Vec<LockView>,
     /// Останні повідомлення, у тому порядку, у якому їх треба показати.
     pub messages: Vec<MessageView>,
-    /// Скільки непрочитаних лежить у Grok.
+    /// Непрочитані питання ([`UnreadKind::Question`]) — головне число сторінки.
+    pub unread_questions: usize,
+    /// Непрочитані адресні, крім питань ([`UnreadKind::Personal`]).
+    pub unread_personal: usize,
+    /// Непрочитані широкомовні ([`UnreadKind::Broadcast`]).
+    pub unread_broadcast: usize,
+    /// Скільки непрочитаних лежить у скриньці Grok.
+    ///
+    /// ⚠️ Це **інша** величина, ніж три лічильники вище: тут `Both`
+    /// рахується обом агентам, тож `unread_grok + unread_claude` більше за
+    /// суму розрядів і ні з чим не збігається. Саме тому воно показується
+    /// найдрібнішим рядком, а не як підсумок.
     pub unread_grok: usize,
-    /// Скільки непрочитаних лежить у Claude.
+    /// Див. [`Snapshot::unread_grok`].
     pub unread_claude: usize,
     /// Коли востаннє робився `render`. `None` — не робився жодного разу.
     pub last_render: Option<i64>,
+}
+
+impl Snapshot {
+    /// Скільки непрочитаних усього — сума трьох розрядів, без подвійного
+    /// рахунку `Both`.
+    pub fn unread_total(&self) -> usize {
+        self.unread_questions + self.unread_personal + self.unread_broadcast
+    }
 }
 
 /// Скільки секунд без `render` вважати «дошка застигла».
@@ -201,7 +265,11 @@ th,td{border:1px solid #ccc;padding:.3rem .5rem;text-align:left;vertical-align:t
 th{background:#f2f2f2}
 .expired{background:#fde8e8;font-weight:bold}
 .unread{font-weight:bold}
-.counts{font-size:1.6rem;margin:.3rem 0}
+.questions{font-size:1.2rem;margin:.4rem 0 0}
+.qnum{font-size:2.6rem;font-weight:bold;line-height:1.1}
+.calm .qnum{font-weight:normal;color:#555}
+.personal{font-size:1rem;margin:.9rem 0 0}
+.broadcast{font-size:.85rem;color:#555;margin:.5rem 0 0}
 .empty{color:#555;font-style:italic}
 .sub{color:#555;font-size:.85rem}
 ";
@@ -235,23 +303,59 @@ pub fn render_page(s: &Snapshot) -> String {
     h
 }
 
-/// Непрочитані — найважливіше число сторінки, тому найперший блок і найбільший
-/// шрифт. Коли `ack` не робиться, це має впадати в око без пояснень.
+/// Непрочитані — трьома числами за спаданням важливості.
+///
+/// ⚠️ Одне число тут було брехнею. «Непрочитаних 41» серед яких питань два —
+/// це не сорок одна хвилина роботи, а дві: решта — широкомовні статуси на
+/// `Both`, які ніхто не чекає прочитаними. Тому головне число сторінки —
+/// **питання**, а широкомовні стоять останніми й дрібним шрифтом.
+///
+/// ⚠️ Нуль питань — добра новина, і оформлюється як добра: те саме велике
+/// число, але спокійним сірим (`calm`) і без жодного знака оклику. Порожня
+/// черга не має виглядати як аварія, інакше сторінку перестануть читати.
 fn push_unread(h: &mut String, s: &Snapshot) {
-    let total = s.unread_grok + s.unread_claude;
     h.push_str("<h2>Непрочитані</h2>\n");
+
+    // 1. Питання без відповіді.
+    let calm = if s.unread_questions == 0 { " calm" } else { "" };
     h.push_str(&format!(
-        "<p class=\"counts\">Grok: <span class=\"unread\">{}</span> &nbsp; \
-         Claude: <span class=\"unread\">{}</span></p>\n",
+        "<p class=\"questions{calm}\">Питань без відповіді: \
+         <span class=\"qnum\">{}</span></p>\n",
+        s.unread_questions
+    ));
+    h.push_str(if s.unread_questions == 0 {
+        "<p class=\"sub\">Черга питань порожня: усе, що питали, уже має відповідь.</p>\n"
+    } else {
+        "<p class=\"sub\">Це повідомлення з op = Q без ack — саме вони чекають \
+         на відповідь.</p>\n"
+    });
+
+    // 2. Адресні, крім питань.
+    h.push_str(&format!(
+        "<p class=\"personal\">Особистих без ack: <span class=\"unread\">{}</span> \
+         <span class=\"sub\">(адресних, не Both, і не питання)</span></p>\n",
+        s.unread_personal
+    ));
+
+    // 3. Широкомовні — дрібно й тихо.
+    h.push_str(&format!(
+        "<p class=\"broadcast\">Широкомовних без ack: {} (Both, не питання — \
+         до відома, відповіді не потребують).</p>\n",
+        s.unread_broadcast
+    ));
+
+    // Довідково: по скриньках — щоб було видно, хто саме не робить ack.
+    //
+    // ⚠️ Спільного підсумку тут немає навмисне. Одне велике число і є те, від
+    // чого пішов цей зріз: воно однакове і для сорока статусів, і для сорока
+    // питань, тобто не каже нічого. Три числа вище вже його заміняють.
+    h.push_str(&format!(
+        "<p class=\"sub\">По скриньках, Both рахується обом: Grok {}, Claude {}.</p>\n",
         s.unread_grok, s.unread_claude
     ));
-    if total == 0 {
+
+    if s.unread_total() == 0 {
         h.push_str("<p class=\"empty\">Непрочитаних немає — ack робиться.</p>\n");
-    } else {
-        h.push_str(&format!(
-            "<p>Разом непрочитаних: <span class=\"unread\">{total}</span>. \
-             Велике число тут означає, що ack фактично не робиться.</p>\n"
-        ));
     }
 }
 
@@ -380,10 +484,23 @@ mod tests {
             now: NOW,
             locks: vec![lock("ui", NOW - 60, 600), lock("store", NOW - 9000, 600)],
             messages: vec![msg(1, true), msg(2, false)],
+            // Живий випадок: 41 «непрочитане» в Claude, а питань — два.
+            unread_questions: 2,
+            unread_personal: 9,
+            unread_broadcast: 30,
             unread_grok: 31,
             unread_claude: 41,
             last_render: Some(NOW - 300),
         }
+    }
+
+    /// Лише блок «Непрочитані»: решта сторінки має власні числа й слова, і
+    /// перевірки лічильників не повинні на них ловитись.
+    fn unread_block(html: &str) -> String {
+        let start = html.find("<h2>Непрочитані</h2>").expect("блок непрочитаних");
+        let rest = &html[start..];
+        let end = rest[1..].find("<h2>").map(|i| i + 1).unwrap_or(rest.len());
+        rest[..end].to_string()
     }
 
     #[test]
@@ -477,18 +594,131 @@ mod tests {
         assert_eq!(escape("звичайний текст"), "звичайний текст");
     }
 
+    /// ⚠️ Головна перевірка зрізу: три числа окремо, а не одне велике.
     #[test]
-    fn unread_counters_show_both_numbers() {
-        let html = render_page(&filled());
-        assert!(html.contains("Grok: <span class=\"unread\">31</span>"), "{html}");
-        assert!(html.contains("Claude: <span class=\"unread\">41</span>"), "{html}");
-        assert!(html.contains("72"), "{html}"); // разом
+    fn three_counters_are_shown_separately_not_as_one_lump() {
+        let s = Snapshot {
+            now: NOW,
+            unread_questions: 3,
+            unread_personal: 8,
+            unread_broadcast: 30,
+            // По скриньках навмисне інші числа: вони рахують Both двічі.
+            unread_grok: 33,
+            unread_claude: 38,
+            ..Snapshot::default()
+        };
+        let block = unread_block(&render_page(&s));
+        assert!(
+            block.contains("Питань без відповіді: <span class=\"qnum\">3</span>"),
+            "{block}"
+        );
+        assert!(
+            block.contains("Особистих без ack: <span class=\"unread\">8</span>"),
+            "{block}"
+        );
+        assert!(block.contains("Широкомовних без ack: 30"), "{block}");
+        // Того самого 41 одним числом бути не має — заради цього все й робилось.
+        // ⚠️ Ловить і спробу «на всяк випадок» дописати спільний підсумок.
+        assert!(!block.contains("41"), "{block}");
+        assert!(!block.contains("Разом"), "{block}");
+    }
+
+    /// Порядок на сторінці = порядок важливості, і він видимий у HTML.
+    #[test]
+    fn counters_go_in_order_of_importance() {
+        let block = unread_block(&render_page(&filled()));
+        let q = block.find("Питань без відповіді").expect("питання");
+        let p = block.find("Особистих без ack").expect("особисті");
+        let b = block.find("Широкомовних без ack").expect("широкомовні");
+        assert!(q < p && p < b, "{block}");
+        // Питання — єдине, що набране великим кеглем.
+        assert_eq!(block.matches("class=\"qnum\"").count(), 1, "{block}");
+        assert!(STYLE.contains(".qnum{font-size:2.6rem"), "{STYLE}");
+        assert!(STYLE.contains(".broadcast{font-size:.85rem"), "{STYLE}");
+    }
+
+    /// ⚠️ Нуль питань — добра новина. Жодної тривоги в оформленні.
+    #[test]
+    fn zero_questions_looks_calm() {
+        let s = Snapshot {
+            now: NOW,
+            unread_questions: 0,
+            unread_personal: 4,
+            unread_broadcast: 37,
+            unread_grok: 20,
+            unread_claude: 21,
+            ..Snapshot::default()
+        };
+        let block = unread_block(&render_page(&s));
+        assert!(
+            block.contains("Питань без відповіді: <span class=\"qnum\">0</span>"),
+            "{block}"
+        );
+        assert!(block.contains("Черга питань порожня"), "{block}");
+        // Ні знаків оклику, ні великих слів-тривог, ні червоного класу.
+        assert!(!block.contains('!'), "{block}");
+        assert!(!block.contains("expired"), "{block}");
+        assert!(!block.contains("УВАГА"), "{block}");
+        // Спокій задається класом, а не самим лише кольором у стилях.
+        assert!(block.contains("class=\"questions calm\""), "{block}");
+        assert!(STYLE.contains(".calm .qnum{font-weight:normal;color:#555}"), "{STYLE}");
+        // Червоне в стилях лишається тільки для протермінованих замків.
+        assert_eq!(STYLE.matches("#fde8e8").count(), 1, "{STYLE}");
+    }
+
+    /// Ненульові питання спокійного класу не отримують — інакше різниці
+    /// між «нуль» і «є що робити» на сторінці не видно.
+    #[test]
+    fn some_questions_are_not_marked_calm() {
+        let block = unread_block(&render_page(&filled()));
+        assert!(block.contains("class=\"questions\""), "{block}");
+        assert!(!block.contains("calm"), "{block}");
+        assert!(block.contains("op = Q"), "{block}");
+    }
+
+    #[test]
+    fn question_to_both_is_still_a_question() {
+        assert_eq!(classify_unread(BOTH, OP_QUESTION), UnreadKind::Question);
+        assert_eq!(classify_unread("Claude", OP_QUESTION), UnreadKind::Question);
+        assert_eq!(classify_unread("Grok", "Q"), UnreadKind::Question);
+    }
+
+    #[test]
+    fn both_without_question_is_broadcast_not_personal() {
+        assert_eq!(classify_unread(BOTH, "N"), UnreadKind::Broadcast);
+        assert_eq!(classify_unread(BOTH, "A"), UnreadKind::Broadcast);
+        assert_eq!(classify_unread(BOTH, "L"), UnreadKind::Broadcast);
+    }
+
+    #[test]
+    fn addressed_non_question_is_personal() {
+        assert_eq!(classify_unread("Claude", "N"), UnreadKind::Personal);
+        assert_eq!(classify_unread("Grok", "A"), UnreadKind::Personal);
+        // Невідомий адресат — теж адресний: він точно не «обом».
+        assert_eq!(classify_unread("Хтось", "N"), UnreadKind::Personal);
+    }
+
+    #[test]
+    fn unread_total_sums_the_three_kinds_without_double_counting() {
+        // ⚠️ Не `unread_grok + unread_claude`: там Both рахується двічі.
+        assert_eq!(filled().unread_total(), 2 + 9 + 30);
+    }
+
+    #[test]
+    fn mailbox_counts_stay_but_quietly() {
+        let block = unread_block(&render_page(&filled()));
+        assert!(block.contains("Grok 31, Claude 41"), "{block}");
+        // Дрібним шрифтом і останнім рядком, а не головним числом сторінки.
+        assert!(block.contains("<p class=\"sub\">По скриньках"), "{block}");
+        let q = block.find("Питань без відповіді").expect("питання");
+        assert!(block.find("По скриньках").expect("скриньки") > q, "{block}");
     }
 
     #[test]
     fn zero_unread_is_stated_explicitly() {
         let html = render_page(&Snapshot::default());
         assert!(html.contains("Непрочитаних немає"), "{html}");
+        assert!(html.contains("Черга питань порожня"), "{html}");
     }
 
     #[test]

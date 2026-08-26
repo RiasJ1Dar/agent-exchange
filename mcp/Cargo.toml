@@ -12,6 +12,12 @@ path = "src/main.rs"
 [dependencies]
 exchange-store = { path = "../store" }
 exchange-render = { path = "../render" }
+# Вікно перегляду живе всередині сервера: людина хоче бачити стан обміну
+# постійно, а сервер живе рівно стільки, скільки сесія агента. Залежність у
+# межах workspace, нових зовнішніх крейтів не тягне — `exchange-ui` стоїть на
+# `std` плюс уже наявний `rusqlite`. Потрібна лише бінарнику, `lib.rs` її не
+# торкається: бібліотека сервера лишається без UI.
+exchange-ui = { path = "../ui" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
