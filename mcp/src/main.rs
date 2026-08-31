@@ -158,15 +158,31 @@ fn parse_port(raw: &str) -> Result<u16, String> {
     Ok(n)
 }
 
-/// Шляхи ті самі, що бере сам сервер: [`exchange_mcp::resolve_paths`].
+/// Шляхи ті самі, що бере сам сервер: [`exchange_mcp::resolve_paths_checked`].
 ///
 /// Свідомо **не** `exchange_ui::db::db_path()`: та функція трактує порожню
 /// змінну як заданий шлях, і вікно тоді дивилось би не в ту базу, що сервер.
 /// Розбіжність показувала б людині чужий стан — гірше за відсутнє вікно.
-fn paths_from_env() -> (PathBuf, PathBuf) {
+///
+/// ⚠️ І свідомо **не** `resolve_paths` без перевірки, як було раніше.
+/// `EXCHANGE_DB` та `EXCHANGE_NOW_MD` працюють лише парою; при заданій
+/// половині сервер відмовляється стартувати, а вікно на старому виклику
+/// піднімалось і показувало **базу з копії поруч із бойовим `NOW.md`** —
+/// дві різні реальності в одній сторінці. Читання від цього не руйнівне,
+/// але висновок, який людина з тієї сторінки робить, — хибний. Тому те саме
+/// правило, що в сервера: обидві змінні або жодної.
+///
+/// Значення приймаються аргументами, а не читаються звідси, щоб перевірятись
+/// тестами без `std::env::set_var` — той небезпечний і ламає паралельні тести.
+fn ui_paths(db_env: Option<&str>, now_env: Option<&str>) -> Result<(PathBuf, PathBuf), String> {
+    exchange_mcp::resolve_paths_checked(db_env, now_env).map_err(|e| e.to_string())
+}
+
+/// Прочитати env і віддати шляхи вікна. Тонка обгортка над [`ui_paths`].
+fn paths_from_env() -> Result<(PathBuf, PathBuf), String> {
     let db = std::env::var(exchange_mcp::DB_ENV).ok();
     let now = std::env::var(exchange_mcp::NOW_MD_ENV).ok();
-    exchange_mcp::resolve_paths(db.as_deref(), now.as_deref())
+    ui_paths(db.as_deref(), now.as_deref())
 }
 
 /// Спробувати підняти вікно. Невдача — це рядок у stderr, а не зупинка.
@@ -175,6 +191,18 @@ fn paths_from_env() -> (PathBuf, PathBuf) {
 /// **не падає** і не шукає інший порт: два однакові вікна на різних портах
 /// плутали б людину сильніше, ніж одне. Хто перший стартував — той тримає.
 fn start_ui(port: u16) {
+    // ⚠️ Шляхи — до `bind`, а не після. Половина пари означає, що вікна не
+    // буде взагалі, тож порт нема за що займати: інакше сусідній інстанс,
+    // якому шляхи задані правильно, дістав би «порт зайнятий» від вікна,
+    // яке однаково не піднімається.
+    let (db_path, now_md) = match paths_from_env() {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("exchange-mcp: ui.unavailable reason=env_paths detail={msg}");
+            return;
+        }
+    };
+
     let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
         Ok(l) => l,
         Err(e) => {
@@ -182,8 +210,6 @@ fn start_ui(port: u16) {
             return;
         }
     };
-
-    let (db_path, now_md) = paths_from_env();
 
     // ⚠️ Окремий потік, і паніка в ньому не має валити сервер. `catch_unwind`
     // тут не для краси: `serve` викликає обробник на кожен запит, а обмін
@@ -380,6 +406,64 @@ mod tests {
         let (db, now) = exchange_mcp::resolve_paths(Some("  "), Some(""));
         assert_eq!(db, PathBuf::from(exchange_mcp::PROD_DB));
         assert_eq!(now, PathBuf::from(exchange_mcp::PROD_NOW_MD));
+    }
+
+    /// Обидві змінні задані — вікно бере рівно ті самі шляхи, що й сервер,
+    /// і жодної відмови: поведінка при повній парі не змінилась.
+    #[test]
+    fn ui_and_server_take_the_same_paths_when_pair_is_set() {
+        let db = r"C:\копія\exchange.db";
+        let now = r"C:\копія\NOW.md";
+
+        let ui = ui_paths(Some(db), Some(now)).expect("пара задана — відмови бути не може");
+        let server = exchange_mcp::resolve_paths_checked(Some(db), Some(now))
+            .expect("сервер на тій самій парі теж стартує");
+
+        assert_eq!(ui, server, "вікно і сервер розійшлись у шляхах");
+        assert_eq!(ui.0, PathBuf::from(db));
+        assert_eq!(ui.1, PathBuf::from(now));
+    }
+
+    /// Жодної змінної — прод-константи, як і було.
+    #[test]
+    fn ui_falls_back_to_prod_when_nothing_is_set() {
+        for (db, now) in [(None, None), (Some(""), Some("   ")), (Some("  "), Some(""))] {
+            let ui = ui_paths(db, now).expect("жодної заданої — це не половина пари");
+            assert_eq!(ui.0, PathBuf::from(exchange_mcp::PROD_DB));
+            assert_eq!(ui.1, PathBuf::from(exchange_mcp::PROD_NOW_MD));
+            assert_eq!(
+                ui,
+                exchange_mcp::resolve_paths_checked(db, now).unwrap(),
+                "вікно і сервер розійшлись на порожніх змінних"
+            );
+        }
+    }
+
+    /// ⚠️ Головний тест зрізу: задана половина пари — вікно **не** піднімається.
+    ///
+    /// Симптом, який він ловить: сторінка показує базу з копії поруч із
+    /// бойовим `NOW.md`, і людина читає це як один стан. Сервер у цей момент
+    /// відмовляється стартувати, тож вікно мусить відмовитись разом із ним.
+    #[test]
+    fn half_a_pair_stops_the_window_instead_of_mixing_paths() {
+        let db = r"C:\копія\exchange.db";
+        let now = r"C:\копія\NOW.md";
+
+        for (d, n) in [
+            (Some(db), None),
+            (None, Some(now)),
+            (Some(db), Some("")),
+            (Some(db), Some("   ")),
+            (Some(""), Some(now)),
+        ] {
+            let err = ui_paths(d, n)
+                .expect_err("половина пари мусить зупиняти вікно, а не давати шляхи");
+            assert!(!err.is_empty(), "порожня причина для {d:?}/{n:?}");
+            assert!(
+                err.contains(exchange_mcp::DB_ENV) && err.contains(exchange_mcp::NOW_MD_ENV),
+                "причина мусить називати обидві змінні, а сказано: {err}"
+            );
+        }
     }
 
     #[test]
