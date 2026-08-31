@@ -23,6 +23,20 @@ pub const SCHEMA_VERSION: i64 = 1;
 /// дізнається, що частину думки з'їли.
 pub const MAX_BODY_CHARS: usize = 2000;
 
+/// Стеля теми — 200 символів **вхідного** рядка (до [`normalize_topic`]).
+///
+/// Міряється саме вхід, а не нормалізована форма: нормалізація лише
+/// скорочує, і мегабайт пробілів не має доїжджати навіть до неї.
+/// Стеля тіла нічого не важила, поки той самий виклик міг пронести
+/// мегабайт сусіднім полем: тема лягає в `messages.topic` і в `locks.topic`,
+/// і звідти — у `NOW.md`, який фсинкається на кожен запис.
+pub const MAX_TOPIC_CHARS: usize = 200;
+
+/// Стеля нотатки замка — 1000 символів вхідного рядка.
+/// Причина та сама, що й у [`MAX_TOPIC_CHARS`]: `locks.note` теж
+/// потрапляє в `NOW.md` при кожному рендері.
+pub const MAX_NOTE_CHARS: usize = 1000;
+
 /// Нижня межа TTL замка. Менші значення затискаються сюди.
 pub const MIN_TTL_SEC: i64 = 60;
 /// Верхня межа TTL замка. Більші значення затискаються сюди.
@@ -230,6 +244,16 @@ pub enum Error {
          скоротіть текст або винесіть його у файл. Мовчки обрізати я не буду"
     )]
     BodyTooLong { chars: usize, max: usize },
+    #[error(
+        "тема — {chars} символів, стеля {max}: скоротіть тему. \
+         Мовчки обрізати я не буду"
+    )]
+    TopicTooLong { chars: usize, max: usize },
+    #[error(
+        "нотатка замка — {chars} символів, стеля {max}: скоротіть нотатку \
+         або винесіть текст у повідомлення. Мовчки обрізати я не буду"
+    )]
+    NoteTooLong { chars: usize, max: usize },
     #[error("{0} не може писати сам собі: to має відрізнятись від from")]
     SelfMessage(Agent),
     #[error("сховище пошкоджено (mutex poison)")]
@@ -339,6 +363,33 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Тема в межах [`MAX_TOPIC_CHARS`]. Перевищення — помилка, не обрізання.
+///
+/// Викликається **до** [`normalize_topic`]: нормалізація тільки скорочує,
+/// тож міряти після неї означало б пропускати мегабайтний вхід усередину.
+fn check_topic(topic: &str) -> Result<(), Error> {
+    let chars = topic.chars().count();
+    if chars > MAX_TOPIC_CHARS {
+        return Err(Error::TopicTooLong {
+            chars,
+            max: MAX_TOPIC_CHARS,
+        });
+    }
+    Ok(())
+}
+
+/// Нотатка замка в межах [`MAX_NOTE_CHARS`]. Перевищення — помилка.
+fn check_note(note: &str) -> Result<(), Error> {
+    let chars = note.chars().count();
+    if chars > MAX_NOTE_CHARS {
+        return Err(Error::NoteTooLong {
+            chars,
+            max: MAX_NOTE_CHARS,
+        });
+    }
+    Ok(())
+}
+
 fn expire_locks(conn: &Connection, now: i64) -> Result<(), Error> {
     conn.execute(
         "DELETE FROM locks WHERE taken_at + ttl_sec <= ?1",
@@ -369,6 +420,9 @@ fn post_with_conn(conn: &Connection, env: Envelope) -> Result<i64, Error> {
     if env.from == env.to {
         return Err(Error::SelfMessage(env.from));
     }
+    // Тема міряється нарівні з тілом: без цього стеля тіла обходилась
+    // сусіднім полем того самого виклику.
+    check_topic(&env.topic)?;
     let body = serde_json::to_string(&env.body)?;
     let chars = body.chars().count();
     if chars > MAX_BODY_CHARS {
@@ -682,6 +736,35 @@ impl Store {
         Ok(())
     }
 
+    /// Підтвердити **одне** повідомлення від імені `agent`.
+    ///
+    /// ⚠️ Це заміна [`Store::ack`] для всього нового коду. Той позначає рядок
+    /// **за самим лише `id`**, без перевірки адресата: будь-хто може погасити
+    /// чуже повідомлення, і повернути це нічим — `read_at = NULL` в API немає,
+    /// а `id` усіх чужих листів лежать відкрито в `agent_talk.md`.
+    ///
+    /// Тут позначається лише те, що адресоване цьому агентові (`to == agent`
+    /// або `to == Both`) **і ще не прочитане**.
+    ///
+    /// * `true` — позначено;
+    /// * `false` — не адресоване цьому агентові, не існує або вже прочитане.
+    ///
+    /// Жоден із трьох випадків не помилка — так само, як в [`Store::ack_many`]:
+    /// «нічого не позначив» — це відповідь, а не збій. Розрізняти їх ззовні
+    /// свідомо не можна: інакше `ack_one` став би оракулом, що каже, які чужі
+    /// `id` існують.
+    pub fn ack_one(&self, id: i64, agent: Agent) -> Result<bool, Error> {
+        let conn = self.conn()?;
+        let n = conn.execute(
+            "UPDATE messages SET read_at = ?1
+             WHERE id = ?2
+               AND (to_agent = ?3 OR to_agent = 'Both')
+               AND read_at IS NULL",
+            params![now_unix(), id, agent.as_str()],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Підтвердити пачку повідомлень від імені `agent`.
     ///
     /// Позначаються лише ті, що адресовані цьому агентові (`to == agent` або
@@ -721,18 +804,30 @@ impl Store {
         Ok(acked)
     }
 
-    /// Тихе взяття замка — поведінка збережена байт-у-байт: протермінований
-    /// чужий замок зникає без сліду й без сповіщення.
+    /// Тихе взяття замка: протермінований чужий замок зникає без сліду
+    /// й без сповіщення (на відміну від [`Store::lock_ex`]).
     ///
-    /// Делегат до [`lock_inner`] з `notify = false`. Для нового коду беріть
-    /// [`Store::lock_ex`]: він показує, кого саме витіснили.
+    /// ⚠️ Читання стану теми і запис рядка йдуть **однією `IMMEDIATE`-
+    /// транзакцією**, тією самою гілкою, що й у [`Store::lock_ex`]. Двома
+    /// окремими autocommit-ами (SELECT, потім `INSERT … ON CONFLICT`) це було
+    /// TOCTOU: на чотирьох живих процесах обидва встигали прочитати «тема
+    /// вільна», обидва діставали `Ok` — і обидва вважали тему своєю.
+    /// `busy_timeout` тут не рятує: `SQLITE_BUSY` не виникає взагалі,
+    /// конфлікт логічний, а не блокувальний.
+    ///
+    /// Сигнатура навмисне лишається `Result<(), Error>` — її кличе `mcp`.
+    /// Кому саме віддали тему після протермінування, показує [`Store::lock_ex`].
     pub fn lock(&self, topic: &str, holder: Agent, ttl_sec: i64, note: &str) -> Result<(), Error> {
         if matches!(holder, Agent::Both) {
             return Err(Error::BothCannotLock);
         }
+        check_topic(topic)?;
+        check_note(note)?;
         let topic = normalize_topic(topic);
-        let conn = self.conn()?;
-        lock_inner(&conn, &topic, holder, ttl_sec, note, false)?;
+        let mut conn = self.conn()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        lock_inner(&tx, &topic, holder, ttl_sec, note, false)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -757,6 +852,8 @@ impl Store {
         if matches!(holder, Agent::Both) {
             return Err(Error::BothCannotLock);
         }
+        check_topic(topic)?;
+        check_note(note)?;
         let topic = normalize_topic(topic);
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -780,6 +877,7 @@ impl Store {
         if matches!(holder, Agent::Both) {
             return Err(Error::BothCannotLock);
         }
+        check_topic(topic)?;
         let topic = normalize_topic(topic);
         let topic = topic.as_str();
         let conn = self.conn()?;
@@ -1703,5 +1801,214 @@ mod tests {
         e.v = 2;
         let err = store.post(e).unwrap_err();
         assert!(matches!(err, Error::BadVersion(2)));
+    }
+
+    /// Гонка за темою між **двома різними `Store`** на одному файлі.
+    ///
+    /// Два `Store` — це принципово: усередині одного процесу теми стеріг
+    /// `Mutex<Connection>`, і гонки не було видно. Реальні чотири агенти —
+    /// чотири процеси, чотири власні мютекси й одна база; єдине, що їх
+    /// серіалізує, — транзакція в самій SQLite. До фіксу `lock` робив SELECT
+    /// і `INSERT … ON CONFLICT` окремими autocommit-ами, і обидва потоки
+    /// діставали `Ok` на ту саму тему.
+    #[test]
+    fn two_locks_race_for_one_topic_and_only_one_wins() {
+        use std::sync::{mpsc, Barrier};
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("exchange.db");
+        // Обидва Store бачать один файл, але мають окремі з'єднання й окремі
+        // мютекси — як два процеси.
+        let a = Store::open(&path).unwrap();
+        let b = Store::open(&path).unwrap();
+
+        let gate = std::sync::Arc::new(Barrier::new(2));
+        let (tx, rx) = mpsc::channel();
+
+        let mut handles = Vec::new();
+        for (store, holder) in [(a, Agent::Grok), (b, Agent::Claude)] {
+            let gate = std::sync::Arc::clone(&gate);
+            let tx = tx.clone();
+            handles.push(std::thread::spawn(move || {
+                gate.wait();
+                let r = store.lock("гонка", holder, DEFAULT_TTL_SEC, "мій");
+                let _ = tx.send((holder, r));
+            }));
+        }
+        drop(tx);
+
+        let mut winners = Vec::new();
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let (holder, r) = rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("потік не відзвітував: lock завис");
+            match r {
+                Ok(()) => winners.push(holder),
+                Err(Error::LockHeld { .. }) => held.push(holder),
+                Err(other) => panic!("очікував Ok або LockHeld, отримав {other:?}"),
+            }
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            winners.len(),
+            1,
+            "тему віддали двом одразу: {winners:?} — TOCTOU у lock"
+        );
+        assert_eq!(held.len(), 1, "другий мав дістати LockHeld");
+
+        let check = Store::open(&path).unwrap();
+        let locks = check.locks().unwrap();
+        assert_eq!(locks.len(), 1, "на одну тему два рядки");
+        assert_eq!(
+            locks[0].holder, winners[0],
+            "у базі сидить не той, кому сказали Ok"
+        );
+    }
+
+    fn str_of_len(n: usize) -> String {
+        "я".repeat(n)
+    }
+
+    /// Стеля теми — помилка, не обрізання; і вона діє в кожному вході,
+    /// а не лише в `post`.
+    #[test]
+    fn topic_over_the_limit_is_an_error() {
+        let (_tmp, store) = tmp_store();
+
+        let ok = str_of_len(MAX_TOPIC_CHARS);
+        let too_long = str_of_len(MAX_TOPIC_CHARS + 1);
+
+        // post
+        store
+            .post(env_topic(Agent::Grok, Agent::Claude, &ok, json!({"a": 1})))
+            .unwrap();
+        let err = store
+            .post(env_topic(
+                Agent::Grok,
+                Agent::Claude,
+                &too_long,
+                json!({"a": 1}),
+            ))
+            .unwrap_err();
+        match err {
+            Error::TopicTooLong { chars, max } => {
+                assert_eq!(chars, MAX_TOPIC_CHARS + 1);
+                assert_eq!(max, MAX_TOPIC_CHARS);
+            }
+            other => panic!("очікував TopicTooLong, отримав {other:?}"),
+        }
+
+        // lock / lock_ex / unlock
+        store.lock(&ok, Agent::Grok, DEFAULT_TTL_SEC, "ок").unwrap();
+        assert!(matches!(
+            store
+                .lock(&too_long, Agent::Grok, DEFAULT_TTL_SEC, "ні")
+                .unwrap_err(),
+            Error::TopicTooLong { .. }
+        ));
+        assert!(matches!(
+            store
+                .lock_ex(&too_long, Agent::Grok, DEFAULT_TTL_SEC, "ні")
+                .unwrap_err(),
+            Error::TopicTooLong { .. }
+        ));
+        assert!(matches!(
+            store.unlock(&too_long, Agent::Grok).unwrap_err(),
+            Error::TopicTooLong { .. }
+        ));
+        store.unlock(&ok, Agent::Grok).unwrap();
+
+        // Довга тема не осіла в базі жодним шляхом.
+        assert!(store.locks().unwrap().is_empty());
+        let inbox = store.inbox(Agent::Claude, false).unwrap();
+        assert_eq!(inbox.len(), 1, "у базу проліз зайвий запис");
+        assert_eq!(inbox[0].envelope.topic.chars().count(), MAX_TOPIC_CHARS);
+    }
+
+    /// Стеля нотатки замка — так само помилка.
+    #[test]
+    fn note_over_the_limit_is_an_error() {
+        let (_tmp, store) = tmp_store();
+
+        let ok = str_of_len(MAX_NOTE_CHARS);
+        let too_long = str_of_len(MAX_NOTE_CHARS + 1);
+
+        store
+            .lock("xvid/core", Agent::Grok, DEFAULT_TTL_SEC, &ok)
+            .unwrap();
+        assert_eq!(
+            store.locks().unwrap()[0].note.chars().count(),
+            MAX_NOTE_CHARS
+        );
+
+        let err = store
+            .lock("xvid/core", Agent::Grok, DEFAULT_TTL_SEC, &too_long)
+            .unwrap_err();
+        match err {
+            Error::NoteTooLong { chars, max } => {
+                assert_eq!(chars, MAX_NOTE_CHARS + 1);
+                assert_eq!(max, MAX_NOTE_CHARS);
+            }
+            other => panic!("очікував NoteTooLong, отримав {other:?}"),
+        }
+
+        assert!(matches!(
+            store
+                .lock_ex("xvid/core", Agent::Grok, DEFAULT_TTL_SEC, &too_long)
+                .unwrap_err(),
+            Error::NoteTooLong { .. }
+        ));
+
+        // Відмова нічого не переписала: у базі лишилась стара нотатка.
+        assert_eq!(
+            store.locks().unwrap()[0].note.chars().count(),
+            MAX_NOTE_CHARS
+        );
+    }
+
+    /// `ack_one` гасить лише своє — і мовчить, а не падає, на чуже.
+    #[test]
+    fn ack_one_marks_only_own_messages() {
+        let (_tmp, store) = tmp_store();
+
+        let to_claude = store
+            .post(env(Agent::Grok, Agent::Claude, Op::Q, json!({"q": 1})))
+            .unwrap();
+        let to_grok = store
+            .post(env(Agent::Claude, Agent::Grok, Op::A, json!({"a": 1})))
+            .unwrap();
+        let to_both = store
+            .post(env(Agent::Grok, Agent::Both, Op::N, json!({"n": 1})))
+            .unwrap();
+
+        // Чуже — false, без помилки, і чуже лишається непрочитаним.
+        assert!(!store.ack_one(to_grok, Agent::Claude).unwrap());
+        let grok_unread = store.inbox(Agent::Grok, true).unwrap();
+        assert!(
+            grok_unread.iter().any(|m| m.id == to_grok),
+            "Claude погасив чуже повідомлення"
+        );
+
+        // Неіснуюче — теж false, а не NotFound.
+        assert!(!store.ack_one(999_999, Agent::Claude).unwrap());
+
+        // Своє — true; повторно — false.
+        assert!(store.ack_one(to_claude, Agent::Claude).unwrap());
+        assert!(!store.ack_one(to_claude, Agent::Claude).unwrap());
+
+        // Both адресоване обом — Claude має право його погасити.
+        assert!(store.ack_one(to_both, Agent::Claude).unwrap());
+
+        let unread: Vec<i64> = store
+            .inbox(Agent::Claude, true)
+            .unwrap()
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        assert!(unread.is_empty(), "лишились непрочитані: {unread:?}");
     }
 }
