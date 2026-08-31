@@ -70,6 +70,9 @@ pub enum Error {
     MissingContentLength,
     #[error("невірні параметри: {0}")]
     InvalidParams(String),
+    /// Задана половина пари `EXCHANGE_DB` / `EXCHANGE_NOW_MD` — див. [`check_env_pair`].
+    #[error("{0}")]
+    EnvPaths(String),
 }
 
 pub struct Mcp {
@@ -92,6 +95,47 @@ impl Mcp {
     fn rerender(&self) -> Result<(), Error> {
         exchange_render::render(&self.store, &self.now_md)?;
         Ok(())
+    }
+
+    /// Перемалювати NOW.md **як побічний ефект**: збій не піднімається вгору,
+    /// а повертається текстом.
+    ///
+    /// ⚠️ stdout — канал протоколу MCP, тому слід іде тільки в stderr.
+    fn rerender_note(&self) -> Option<String> {
+        match exchange_render::render(&self.store, &self.now_md) {
+            Ok(()) => None,
+            Err(e) => {
+                let msg = e.to_string();
+                eprintln!("exchange-mcp: render.failed detail={msg}");
+                Some(msg)
+            }
+        }
+    }
+
+    /// Успішна відповідь на запис + перемальовування.
+    ///
+    /// ⚠️ Операція вже **закомічена**: `id` виданий, замок узятий, `read_at`
+    /// проставлений. Якщо після цього впав `render` (людина зіпсувала маркери
+    /// в NOW.md, io-помилка, delete-pending від сусіднього процесу), то це збій
+    /// малювання, а не запису. Віддавати його замість результату — рівно те,
+    /// що штовхає агента на повтор: `post` кладе в базу дублікат, `lock`
+    /// лишається взятим при відповіді «не вийшло», а повторний `ack_many` дає
+    /// `acked = 0`, не відрізнити від справжньої відмови. Тому збій рендера —
+    /// окреме поле `render_error` в **успішній** відповіді, і NOW.md полагодять
+    /// наступним `render`, коли маркери повернуть на місце.
+    fn rendered(&self, value: Value) -> Value {
+        let Some(msg) = self.rerender_note() else {
+            return tool_ok(value);
+        };
+        match value {
+            Value::Object(mut map) => {
+                map.insert("render_error".to_string(), json!(msg));
+                tool_ok(Value::Object(map))
+            }
+            // Усі корисні навантаження тут — обʼєкти; гілка лишається, щоб
+            // «інше» не з'їло поле мовчки.
+            other => tool_ok(json!({ "result": other, "render_error": msg })),
+        }
     }
 
     pub fn handle_rpc(&self, req: &Value) -> Option<Value> {
@@ -142,8 +186,7 @@ impl Mcp {
             "post" => {
                 let env = envelope_from_args(args, agent_env)?;
                 let id = self.store.post(env)?;
-                self.rerender()?;
-                Ok(tool_ok(json!({ "id": id })))
+                Ok(self.rendered(json!({ "id": id })))
             }
             "inbox" => {
                 let agent = json_field::<Agent>(args, "agent")?;
@@ -174,20 +217,27 @@ impl Mcp {
                     .get("note")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                self.store.lock(topic, holder, ttl_sec, note)?;
-                self.rerender()?;
-                Ok(tool_ok(json!({
+                // ⚠️ Саме `lock_ex`, а не `lock`: узяття йде однією
+                // `BEGIN IMMEDIATE`-транзакцією (чотири процеси пишуть у ту
+                // саму базу, а перевірка й запис у `lock` — два незалежні
+                // autocommit-и), а перехоплення протермінованого замка
+                // лишає слід: `evicted` у відповіді й сповіщення `Op::N`
+                // колишньому тримачеві. Тихий варіант мовчки забирав тему,
+                // і той, у кого її забрали, продовжував вважати її своєю.
+                let outcome = self.store.lock_ex(topic, holder, ttl_sec, note)?;
+                Ok(self.rendered(json!({
                     "ok": true,
                     "topic": topic,
-                    "holder": holder
+                    "holder": holder,
+                    "evicted": outcome.evicted,
+                    "notified_id": outcome.notified_id
                 })))
             }
             "unlock" => {
                 let topic = json_str(args, "topic")?;
                 let holder = resolve_agent(args, "holder", agent_env)?;
                 self.store.unlock(topic, holder)?;
-                self.rerender()?;
-                Ok(tool_ok(json!({
+                Ok(self.rendered(json!({
                     "ok": true,
                     "topic": topic,
                     "holder": holder
@@ -213,12 +263,35 @@ impl Mcp {
     /// перевагу одному означало б тихо проігнорувати половину прохання),
     /// жодного — теж помилка. Далі шляхи не змішуються:
     ///
-    /// * `id` лишається як був — [`Store::ack`], без агента, `NotFound`
-    ///   на невідомий id. Наявні виклики проходять байт-у-байт;
+    /// * `id` іде через [`Store::ack_one`] і **потребує особистості**
+    ///   так само, як пачка. ⚠️ Раніше тут стояв [`Store::ack`] — позначення
+    ///   за самим лише `id`, без адресата: будь-хто гасив чуже непрочитане,
+    ///   і повернути це не було чим (`read_at = NULL` в API немає, а чужі
+    ///   `id` відкрито лежать в `agent_talk.md`). Тепер позначається лише
+    ///   своє й лише непрочитане, а `acked = false` (чуже, неіснуюче, вже
+    ///   прочитане) — відповідь, а не збій: розрізняти ці три випадки
+    ///   ззовні означало б зробити `ack` оракулом чужих id;
     /// * `ids` іде через [`Store::ack_many`] і **потребує особистості**:
     ///   пачка позначає лише те, що адресоване цьому агентові. Чужі,
     ///   неіснуючі та вже прочитані просто не рахуються — це відповідь,
     ///   а не збій, тому у відповіді видно і `acked`, і `requested`.
+    /// Особистість для `ack` — один ланцюг на обидва шляхи: явний `agent`
+    /// → `AGENT_NAME` → помилка. `Both` не приймається жодним із них.
+    ///
+    /// Спільна функція, а не два однакові шматки: розійшовшись, вони й дали б
+    /// ту саму дірку, що була в `id` — один шлях питає, чиє це, другий ні.
+    fn ack_agent(&self, args: &Value, agent_env: Option<&str>) -> Result<Agent, Error> {
+        let agent = resolve_agent(args, "agent", agent_env)?;
+        if matches!(agent, Agent::Both) {
+            return Err(Error::InvalidParams(
+                "agent=Both не підтверджує читання: Both — адреса розсилки, \
+                 а не особистість; передайте Grok або Claude"
+                    .into(),
+            ));
+        }
+        Ok(agent)
+    }
+
     fn ack_tool(&self, args: &Value, agent_env: Option<&str>) -> Result<Value, Error> {
         let has_id = has_value(args, "id");
         let has_ids = has_value(args, "ids");
@@ -232,23 +305,20 @@ impl Mcp {
             )),
             (true, false) => {
                 let id = json_i64(args, "id")?;
-                self.store.ack(id)?;
-                self.rerender()?;
-                Ok(tool_ok(json!({ "ok": true, "id": id })))
+                let agent = self.ack_agent(args, agent_env)?;
+                let acked = self.store.ack_one(id, agent)?;
+                Ok(self.rendered(json!({
+                    "ok": true,
+                    "id": id,
+                    "agent": agent,
+                    "acked": acked
+                })))
             }
             (false, true) => {
                 let ids = json_i64_array(args, "ids")?;
-                let agent = resolve_agent(args, "agent", agent_env)?;
-                if matches!(agent, Agent::Both) {
-                    return Err(Error::InvalidParams(
-                        "agent=Both не підтверджує читання: Both — адреса розсилки, \
-                         а не особистість; передайте Grok або Claude"
-                            .into(),
-                    ));
-                }
+                let agent = self.ack_agent(args, agent_env)?;
                 let acked = self.store.ack_many(&ids, agent)?;
-                self.rerender()?;
-                Ok(tool_ok(json!({
+                Ok(self.rendered(json!({
                     "ok": true,
                     "agent": agent,
                     "acked": acked,
@@ -277,16 +347,63 @@ pub fn resolve_paths(db_env: Option<&str>, now_env: Option<&str>) -> (PathBuf, P
     (pick(db_env, PROD_DB), pick(now_env, PROD_NOW_MD))
 }
 
-/// Прочитати env-перевизначення шляхів. Тонка обгортка над [`resolve_paths`]:
-/// сам вибір лишається чистим і тестованим.
-fn paths_from_env() -> (PathBuf, PathBuf) {
+/// Чи змінна справді щось задає. Порожня і з самих пробілів — «не задано»
+/// (те саме правило, що в [`resolve_paths`]).
+fn env_is_set(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some(v) if !v.is_empty())
+}
+
+/// `EXCHANGE_DB` і `EXCHANGE_NOW_MD` працюють **тільки парою**.
+///
+/// ⚠️ Половина пари — це втрата даних, а не незручність. Задана сама лише
+/// `EXCHANGE_DB` (рівно та «безпечна» процедура, яку рекомендував доккоментар:
+/// «прогнати бінарник на копії») означає читання з копії, але запис у **прод**:
+/// `render` мерджить блоки в прод-`NOW.md` людини і переписує з нуля
+/// прод-`agent_talk.md` — обидва зі складом повідомлень із копії, тобто
+/// затирає живу дошку. Дзеркальний випадок — сама лише `EXCHANGE_NOW_MD` —
+/// малює прод-обмін у сторонній файл, а прод-дошка тихо перестає оновлюватись.
+///
+/// Тому відмова старту, а не мовчазний фолбек: обидві або жодної.
+pub fn check_env_pair(db_env: Option<&str>, now_env: Option<&str>) -> Result<(), Error> {
+    match (env_is_set(db_env), env_is_set(now_env)) {
+        (true, false) => Err(Error::EnvPaths(format!(
+            "{DB_ENV} задано, а {NOW_MD_ENV} — ні: сервер читав би базу з копії, \
+             а писав би в прод {PROD_NOW_MD} (і переписував прод-agent_talk.md \
+             складом із копії). Виставте обидві змінні або жодної — наприклад \
+             {NOW_MD_ENV} з NOW.md поруч із тією самою базою."
+        ))),
+        (false, true) => Err(Error::EnvPaths(format!(
+            "{NOW_MD_ENV} задано, а {DB_ENV} — ні: сервер малював би прод-базу \
+             {PROD_DB} у сторонній файл, а прод-NOW.md перестав би оновлюватись. \
+             Виставте обидві змінні або жодної."
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// [`resolve_paths`] з перевіркою пари — вхід для всього, що **пише**.
+///
+/// Сам `resolve_paths` лишається без перевірки навмисно: ним користується
+/// вікно перегляду, яке лише читає, і воно має показувати те саме, що бачить
+/// сервер, навіть коли той відмовляється стартувати.
+pub fn resolve_paths_checked(
+    db_env: Option<&str>,
+    now_env: Option<&str>,
+) -> Result<(PathBuf, PathBuf), Error> {
+    check_env_pair(db_env, now_env)?;
+    Ok(resolve_paths(db_env, now_env))
+}
+
+/// Прочитати env-перевизначення шляхів. Тонка обгортка над
+/// [`resolve_paths_checked`]: сам вибір лишається чистим і тестованим.
+fn paths_from_env() -> Result<(PathBuf, PathBuf), Error> {
     let db = std::env::var(DB_ENV).ok();
     let now = std::env::var(NOW_MD_ENV).ok();
-    resolve_paths(db.as_deref(), now.as_deref())
+    resolve_paths_checked(db.as_deref(), now.as_deref())
 }
 
 pub fn run_stdio() -> Result<(), Error> {
-    let (db, now_md) = paths_from_env();
+    let (db, now_md) = paths_from_env()?;
     let mcp = Mcp::open(&db, &now_md)?;
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
@@ -792,7 +909,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "ack",
-            "description": "Позначити прочитаним і перемалювати NOW.md: або один `id`, або пачка `ids` від імені `agent` (без `agent` він береться зі змінної середовища AGENT_NAME); у відповіді на пачку acked проти requested — чужі, неіснуючі та вже прочитані не рахуються й помилкою не є",
+            "description": "Позначити прочитаним і перемалювати NOW.md: або один `id`, або пачка `ids` — обидва шляхи від імені `agent` (без `agent` він береться зі змінної середовища AGENT_NAME) і позначають лише адресоване йому; у відповіді acked (на пачку — проти requested): чуже, неіснуюче та вже прочитане не рахується й помилкою не є",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -804,7 +921,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "lock",
-            "description": "Взяти замок на тему і перемалювати NOW.md; без `holder` власник береться зі змінної середовища AGENT_NAME",
+            "description": "Взяти замок на тему і перемалювати NOW.md; без `holder` власник береться зі змінної середовища AGENT_NAME; перехоплення протермінованого чужого замка видно в полі evicted, а колишньому тримачеві лягає сповіщення (notified_id)",
             "inputSchema": {
                 "type": "object",
                 "required": ["topic"],
@@ -986,8 +1103,11 @@ mod tests {
         assert_eq!(msgs[0]["id"], id);
         assert!(msgs[0]["read_at"].is_null());
 
-        let acked = call(&mcp, 3, "ack", json!({ "id": id }));
+        // `id` теж підтверджується від імені агента: адресат — Claude, він і
+        // гасить. Без особистості `ack` більше не працює взагалі.
+        let acked = call(&mcp, 3, "ack", json!({ "id": id, "agent": "Claude" }));
         assert_eq!(tool_json(&acked)["ok"], true);
+        assert_eq!(tool_json(&acked)["acked"], true);
 
         let unread = call(
             &mcp,
@@ -1647,19 +1767,142 @@ mod tests {
         }
     }
 
+    /// ⚠️ Раніше цей тест закріплював пастку: задана сама лише `EXCHANGE_DB`
+    /// лишала NOW.md на проді, тобто «прогонка на копії» читала копію, а писала
+    /// в живу дошку. Тепер половина пари — відмова старту.
     #[test]
-    fn one_env_set_leaves_the_other_at_prod() {
+    fn one_env_set_alone_is_refused_with_an_explanation() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("copy.db");
         let now_path = dir.path().join("NOW.copy.md");
 
-        let (db, now) = resolve_paths(Some(db_path.to_str().unwrap()), None);
-        assert_eq!(db, db_path);
-        assert_eq!(now, PathBuf::from(PROD_NOW_MD));
+        let err = resolve_paths_checked(Some(db_path.to_str().unwrap()), None)
+            .expect_err("сама лише база має бути відмовою");
+        let text = err.to_string();
+        assert!(text.contains(DB_ENV), "{text}");
+        assert!(text.contains(NOW_MD_ENV), "{text}");
+        // Текст мусить називати саме те, що постраждало б.
+        assert!(text.contains(PROD_NOW_MD), "{text}");
 
-        let (db, now) = resolve_paths(None, Some(now_path.to_str().unwrap()));
-        assert_eq!(db, PathBuf::from(PROD_DB));
+        let err = resolve_paths_checked(None, Some(now_path.to_str().unwrap()))
+            .expect_err("сам лише NOW.md має бути відмовою");
+        let text = err.to_string();
+        assert!(text.contains(DB_ENV), "{text}");
+        assert!(text.contains(NOW_MD_ENV), "{text}");
+        assert!(text.contains(PROD_DB), "{text}");
+    }
+
+    /// Порожня змінна — «не задано», тож порожня половина пари відмови не дає:
+    /// це рівно той самий прод, а не мішанина.
+    #[test]
+    fn blank_half_counts_as_unset_not_as_half_a_pair() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("copy.db");
+
+        for blank in ["", "   ", "\t"] {
+            let (db, now) = resolve_paths_checked(Some(blank), Some(blank))
+                .unwrap_or_else(|e| panic!("обидві порожні мали пройти: {e}"));
+            assert_eq!(db, PathBuf::from(PROD_DB), "db на «{blank}»");
+            assert_eq!(now, PathBuf::from(PROD_NOW_MD), "now на «{blank}»");
+
+            // А задана база з порожньою парою — та сама пастка, та сама відмова.
+            assert!(
+                resolve_paths_checked(Some(db_path.to_str().unwrap()), Some(blank)).is_err(),
+                "порожній {NOW_MD_ENV} на «{blank}» мав лишитись відмовою"
+            );
+        }
+    }
+
+    /// Обидві задані — працює, і жодного натяку на прод у шляхах.
+    #[test]
+    fn both_env_paths_together_are_accepted() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("copy.db");
+        let now_path = dir.path().join("NOW.copy.md");
+
+        let (db, now) = resolve_paths_checked(
+            Some(db_path.to_str().unwrap()),
+            Some(now_path.to_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(db, db_path);
         assert_eq!(now, now_path);
+    }
+
+    /// Пара змінних у **процесі**, а не в аргументах: `paths_from_env` читає
+    /// глобальний стан, тож ходить під тим самим `ENV_LOCK`.
+    struct PathEnvGuard {
+        prev_db: Option<String>,
+        prev_now: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn set_or_clear(key: &str, value: &Option<String>) {
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    impl Drop for PathEnvGuard {
+        fn drop(&mut self) {
+            set_or_clear(DB_ENV, &self.prev_db);
+            set_or_clear(NOW_MD_ENV, &self.prev_now);
+        }
+    }
+
+    fn with_path_env(db: Option<&str>, now: Option<&str>) -> PathEnvGuard {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = PathEnvGuard {
+            prev_db: std::env::var(DB_ENV).ok(),
+            prev_now: std::env::var(NOW_MD_ENV).ok(),
+            _lock: lock,
+        };
+        set_or_clear(DB_ENV, &db.map(str::to_string));
+        set_or_clear(NOW_MD_ENV, &now.map(str::to_string));
+        guard
+    }
+
+    /// Перевірку пари має робити **прод-вхід**, а не лише чиста функція поруч.
+    ///
+    /// ⚠️ Тест навмисне ходить через `paths_from_env` — те саме, що кличе
+    /// `run_stdio`. Перевіряти самий `resolve_paths_checked` означало б
+    /// пересвідчитись, що безпечний варіант написаний, і не помітити, що
+    /// сервер стартує повз нього.
+    #[test]
+    fn env_pair_is_checked_on_the_startup_path() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("copy.db");
+        let now_path = dir.path().join("NOW.copy.md");
+        let db = db_path.to_str().unwrap();
+        let now = now_path.to_str().unwrap();
+
+        {
+            let _g = with_path_env(Some(db), None);
+            let err = paths_from_env().expect_err("сама лише база мала відмовити старт");
+            let text = err.to_string();
+            assert!(text.contains(NOW_MD_ENV), "{text}");
+            assert!(text.contains(PROD_NOW_MD), "{text}");
+        }
+        {
+            let _g = with_path_env(None, Some(now));
+            let err = paths_from_env().expect_err("сам лише NOW.md мав відмовити старт");
+            let text = err.to_string();
+            assert!(text.contains(DB_ENV), "{text}");
+            assert!(text.contains(PROD_DB), "{text}");
+        }
+        {
+            let _g = with_path_env(Some(db), Some(now));
+            let (got_db, got_now) = paths_from_env().expect("пара цілком — старт дозволено");
+            assert_eq!(got_db, db_path);
+            assert_eq!(got_now, now_path);
+        }
+        {
+            let _g = with_path_env(None, None);
+            let (got_db, got_now) = paths_from_env().expect("жодної змінної — прод");
+            assert_eq!(got_db, PathBuf::from(PROD_DB));
+            assert_eq!(got_now, PathBuf::from(PROD_NOW_MD));
+        }
     }
 
     /// Перевизначені шляхи справді відкриваються — і прод при цьому не
@@ -1795,6 +2038,159 @@ mod tests {
         assert!(!is_error(&resp), "{resp}");
         assert_eq!(tool_json(&resp)["acked"], 0);
         assert_eq!(tool_json(&resp)["requested"], 0);
+    }
+
+    /// Один `id` іде через [`Store::ack_one`], тобто **питає, чиє це**.
+    ///
+    /// ⚠️ Тест сторожить саме той шлях, що раніше стояв на `Store::ack`:
+    /// той гасив непрочитане за самим лише `id`, без адресата, і чужі id
+    /// відкрито лежать в `agent_talk.md`. Тепер чуже лишається чужим, а
+    /// відмова позначати — `acked = false`, а не збій: чуже, неіснуюче й
+    /// уже прочитане ззовні не розрізняються навмисно.
+    #[test]
+    fn ack_single_id_marks_only_own_unread_and_never_errors() {
+        let (_dir, mcp) = tmp_mcp();
+        let foreign = post_msg(&mcp, 1, "Claude", "Grok", "чуже", json!({ "q": "ping" }));
+
+        let resp = call(&mcp, 2, "ack", json!({ "id": foreign, "agent": "Claude" }));
+        assert!(!is_error(&resp), "чужий id — відповідь, а не збій: {resp}");
+        let out = tool_json(&resp);
+        assert_eq!(out["acked"], false, "{out}");
+        assert_eq!(out["id"], foreign, "{out}");
+        assert_eq!(out["agent"], "Claude", "{out}");
+
+        // Головне: адресат досі бачить його непрочитаним.
+        let grok = inbox_msgs(&mcp, 3, json!({ "agent": "Grok", "unread_only": true }));
+        assert_eq!(grok.len(), 1, "чуже мало лишитись непрочитаним: {grok:?}");
+        assert_eq!(grok[0]["id"], foreign);
+
+        // Своє — позначається; повторно вже ні, і теж без помилки.
+        let mine = post_msg(&mcp, 4, "Claude", "Grok", "своє", json!({ "q": "ping" }));
+        let first = call(&mcp, 5, "ack", json!({ "id": mine, "agent": "Grok" }));
+        assert!(!is_error(&first), "{first}");
+        assert_eq!(tool_json(&first)["acked"], true, "{first}");
+        let again = call(&mcp, 6, "ack", json!({ "id": mine, "agent": "Grok" }));
+        assert!(!is_error(&again), "{again}");
+        assert_eq!(tool_json(&again)["acked"], false, "{again}");
+
+        // Неіснуючий id — та сама відповідь, а не оракул чужих id.
+        let missing = call(&mcp, 7, "ack", json!({ "id": 999_999, "agent": "Grok" }));
+        assert!(!is_error(&missing), "{missing}");
+        assert_eq!(tool_json(&missing)["acked"], false, "{missing}");
+    }
+
+    /// Один `id` без особистості — помилка, а не позначення «кимось».
+    #[test]
+    fn ack_single_id_without_agent_is_refused() {
+        let (_dir, mcp) = tmp_mcp();
+        let _guard = with_agent_name(None);
+        let id = post_msg(&mcp, 1, "Grok", "Claude", "тема", json!({ "q": "ping" }));
+
+        let resp = call(&mcp, 2, "ack", json!({ "id": id }));
+        assert!(is_error(&resp), "{resp}");
+        assert!(tool_text(&resp).contains("agent"), "{}", tool_text(&resp));
+
+        let unread = inbox_msgs(&mcp, 3, json!({ "agent": "Claude", "unread_only": true }));
+        assert_eq!(unread.len(), 1, "нічого не мало позначитись");
+    }
+
+    /// `lock` іде через [`Store::lock_ex`] — гучний варіант.
+    ///
+    /// ⚠️ Тихий `Store::lock` повертає `()`, тож `evicted` і `notified_id`
+    /// у відповіді взятись нізвідки: наявність обох полів і є доказом, що
+    /// прод стоїть на `lock_ex`. Сам евікшн (перехоплення протермінованого
+    /// зі сповіщенням колишньому тримачеві) перевіряється в `store` —
+    /// звідси його не поставити: `MIN_TTL_SEC` = 60 с, а зістарити замок
+    /// ззовні `store` нічим, зʼєднання приватне.
+    #[test]
+    fn lock_answer_carries_eviction_fields() {
+        let (_dir, mcp) = tmp_mcp();
+
+        let locked = call(
+            &mcp,
+            1,
+            "lock",
+            json!({ "topic": "xvid/core", "holder": "Grok", "ttl_sec": 90, "note": "працюю" }),
+        );
+        assert!(!is_error(&locked), "{locked}");
+        let out = tool_json(&locked);
+        let map = out.as_object().expect("відповідь lock — обʼєкт");
+        assert!(
+            map.contains_key("evicted"),
+            "у відповіді немає `evicted` — прод, схоже, знову на тихому lock: {out}"
+        );
+        assert!(
+            map.contains_key("notified_id"),
+            "у відповіді немає `notified_id`: {out}"
+        );
+        // Вільна тема — перехоплювати нікого.
+        assert_eq!(out["evicted"], Value::Null, "{out}");
+        assert_eq!(out["notified_id"], Value::Null, "{out}");
+        assert_eq!(out["holder"], "Grok", "{out}");
+    }
+
+    /// `NOW.md`, який насправді тека: `render` на ній падає гарантовано —
+    /// і на читанні, і на записі.
+    fn mcp_with_unrenderable_now_md() -> (tempfile::TempDir, Mcp) {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("exchange.db");
+        let now = dir.path().join("NOW.md");
+        fs::create_dir(&now).unwrap();
+        let mcp = Mcp::open(&db, &now).unwrap();
+        (dir, mcp)
+    }
+
+    /// Збій перемальовування не перетворює виконану операцію на помилку.
+    ///
+    /// ⚠️ Це не про красу відповіді. `post` уже закомічений; віддай агентові
+    /// помилку — він повторить, і в базі ляже дублікат. Те саме з `lock`:
+    /// замок узятий, а відповідь каже «не вийшло».
+    #[test]
+    fn a_failing_rerender_does_not_undo_a_committed_write() {
+        let (_dir, mcp) = mcp_with_unrenderable_now_md();
+
+        let posted = call(
+            &mcp,
+            1,
+            "post",
+            json!({ "from": "Grok", "to": "Claude", "topic": "тема", "op": "N",
+                    "body": { "q": "ping" } }),
+        );
+        assert!(
+            !is_error(&posted),
+            "успішний post не має ставати помилкою через рендер: {posted}"
+        );
+        let out = tool_json(&posted);
+        assert!(out["id"].as_i64().unwrap_or(0) > 0, "{out}");
+        let note = out["render_error"]
+            .as_str()
+            .expect("збій рендера мав лишити слід окремим полем");
+        assert!(!note.is_empty(), "порожній render_error нічого не каже");
+
+        // Повідомлення справді в базі — рівно одне, без повтору.
+        let unread = inbox_msgs(&mcp, 2, json!({ "agent": "Claude", "unread_only": true }));
+        assert_eq!(unread.len(), 1, "{unread:?}");
+
+        // Те саме для замка: узятий і видимий, попри збій малювання.
+        let locked = call(
+            &mcp,
+            3,
+            "lock",
+            json!({ "topic": "xvid/core", "holder": "Grok", "ttl_sec": 90, "note": "працюю" }),
+        );
+        assert!(!is_error(&locked), "{locked}");
+        assert!(
+            tool_json(&locked)["render_error"].is_string(),
+            "{locked}"
+        );
+        let status = call(&mcp, 4, "lock_status", json!({}));
+        assert!(!is_error(&status), "{status}");
+        assert_eq!(tool_json(&status)["count"], 1, "{status}");
+
+        // А сам `render` як інструмент лишається чесним: його робота — саме
+        // малювати, тож його збій — таки збій.
+        let rendered = call(&mcp, 5, "render", json!({}));
+        assert!(is_error(&rendered), "{rendered}");
     }
 
     /// Довге тіло — щоб стеля `brief` було на чому побачити.

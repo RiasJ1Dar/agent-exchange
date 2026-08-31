@@ -2,9 +2,11 @@ use exchange_store::{Agent, Lock, Message, Op, Store};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::fmt::Write as FmtWrite;
+use std::io::ErrorKind;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -16,6 +18,10 @@ pub enum Error {
     /// байти на диску лишились як були.
     #[error("маркери у {}: {reason}", path.display())]
     MalformedMarkers { path: PathBuf, reason: String },
+    /// Чужий замок протримався довше за таймаут — рендер скасовано,
+    /// файл не чіпали. Це не «щось зламалось», а «зараз пише інший».
+    #[error("замок {} зайнятий: чекали {waited:?} і не дочекались", path.display())]
+    LockBusy { path: PathBuf, waited: Duration },
 }
 
 pub struct RenderOpts<'a> {
@@ -58,11 +64,45 @@ pub fn render_now(opts: RenderOpts<'_>) -> Result<(), Error> {
     render(&store, opts.now_md)
 }
 
+/// Рендер під міжпроцесним замком.
+///
+/// BUG-3: цикл «прочитати NOW.md → змерджити → записати» не мав жодної
+/// серіалізації **між процесами**, а живих `exchange-mcp.exe` буває
+/// чотири. Інтерліввінг двох render: обидва читають той самий файл, обидва
+/// мерджать свій зріз, другий кладе поверх першого — і свіже повідомлення
+/// зникає з NOW.md **і** з `agent_talk.md` назавжди, бо render кличеться
+/// лише як побічний ефект наступного запису. Атомарність `write_now_md`
+/// тут не рятує: атомарний там кожен запис окремо, а гонка — між читанням
+/// і записом.
+///
+/// Замок береться **до** читання бази, а не лише навколо файла: інакше
+/// процес міг би прочитати старіший зріз, дочекатись замка й покласти його
+/// поверх новішого — та сама втрата, лише вужчим вікном.
 pub fn render(store: &Store, now_md: &Path) -> Result<(), Error> {
+    render_with(store, now_md, LOCK_WAIT, LOCK_STALE)
+}
+
+/// Те саме тіло, але з явними порогами замка.
+///
+/// Розділення потрібне тестам: із бойовими константами перевірка «чужий
+/// замок поважається» чекала б десять секунд на кожен прогін. Логіка тут
+/// одна на обидва шляхи — `render` лише підставляє константи, тож тест
+/// перевіряє справжній код, а не його спрощену копію.
+fn render_with(
+    store: &Store,
+    now_md: &Path,
+    wait: Duration,
+    stale: Duration,
+) -> Result<(), Error> {
     if is_log_md(now_md) {
         return Ok(());
     }
+    // Guard знімає замок у **всіх** гілках виходу, включно з `?` і panic.
+    let _guard = acquire_lock_with(now_md, wait, stale)?;
+    render_locked(store, now_md)
+}
 
+fn render_locked(store: &Store, now_md: &Path) -> Result<(), Error> {
     let locks = store.locks()?;
     let mut msgs = store.inbox(Agent::Grok, false)?;
     let extra = store.inbox(Agent::Claude, false)?;
@@ -76,7 +116,7 @@ pub fn render(store: &Store, now_md: &Path) -> Result<(), Error> {
     let lock_block = build_lock_block(&locks);
     let inbox_block = build_inbox_block(&msgs);
 
-    let existing = std::fs::read_to_string(now_md).ok();
+    let existing = read_existing(now_md)?;
     let out = merge_now_md(existing.as_deref(), &lock_block, &inbox_block).map_err(|reason| {
         Error::MalformedMarkers {
             path: now_md.to_path_buf(),
@@ -96,6 +136,33 @@ pub fn render(store: &Store, now_md: &Path) -> Result<(), Error> {
     // з NOW.md — єдине, що працює однаково і на дошці, і на tempdir.
     write_now_md(&agent_talk_path(now_md), &build_agent_talk(&msgs))?;
     Ok(())
+}
+
+/// Прочитати наявний NOW.md перед мержем.
+///
+/// BUG-4: тут стояло `read_to_string(now_md).ok()`, і **будь-яка**
+/// io-помилка ставала `None` → `merge_now_md(None, ..)` → каркас →
+/// рукопис людини затерто. Це не теорія: `MoveFileEx` із сусіднього
+/// процесу (наш власний атомарний запис) лишає файл у стані
+/// delete-pending, і `read_to_string` дає на ньому `PermissionDenied`,
+/// а не `NotFound`. Так само `InvalidData`, якщо файл раптом не UTF-8.
+///
+/// `NotFound` — **єдиний** випадок, коли каркас правомірний: файла
+/// справді немає, затирати нічого. Решта — `Err`, і файл не чіпаємо:
+/// краще жодного оновлення, ніж порожній NOW.md.
+///
+/// ⚠️ Розвилка живе окремою функцією навмисно. Тестувати її через
+/// `render` не виходить: у більшості сценаріїв, де читання падає,
+/// падає й запис, тож назовні і з багом, і без нього приїжджає той
+/// самий `Err` — тест зеленіє на баговій версії й нічого не ловить.
+/// Небезпечний випадок — рівно той, де читання падає, а **запис
+/// вдається**.
+fn read_existing(now_md: &Path) -> Result<Option<String>, Error> {
+    match std::fs::read_to_string(now_md) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// `agent_talk.md` поруч із `now_md`.
@@ -661,11 +728,128 @@ fn write_now_md(now_md: &Path, contents: &str) -> Result<(), Error> {
     }
 }
 
+/// Скільки чекати на чужий замок, перш ніж здатись.
+///
+/// Рендер — побічний ефект запису, а не самоціль: краще віддати помилку
+/// «зараз пише інший», ніж тримати виклик хвилинами. Один цикл render
+/// займає мілісекунди, тож десять секунд — це вже про залипле, а не про
+/// звичайну чергу.
+const LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// Після якого віку замок вважається покинутим.
+///
+/// ⚠️ Без цього порогу замок від **убитого** процесу заклинив би обмін
+/// назавжди: файл лишається на диску, знімати його нікому. Поріг свідомо
+/// на порядок більший за тривалість самого циклу.
+const LOCK_STALE: Duration = Duration::from_secs(30);
+
+/// Пауза між спробами взяти замок.
+const LOCK_POLL: Duration = Duration::from_millis(20);
+
+/// `.NOW.md.lock` поруч із самим файлом — так само, як `tmp_path_for`.
+fn lock_path_for(now_md: &Path) -> PathBuf {
+    match now_md.file_name().and_then(|n| n.to_str()) {
+        Some(name) => now_md.with_file_name(format!(".{name}.lock")),
+        None => now_md.with_extension("lock"),
+    }
+}
+
+/// Взятий замок. Знімається у `Drop`, тобто в **усіх** гілках виходу:
+/// і на `?` посеред merge, і на panic у тесті.
+///
+/// Провал зняття не ковтаємо: замок, що лишився, — це наступні тридцять
+/// секунд чекання для всіх, і мовчазний слід тут дорожчий за рядок
+/// у stderr.
+#[derive(Debug)]
+struct LockGuard {
+    path: PathBuf,
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            if e.kind() != ErrorKind::NotFound {
+                eprintln!(
+                    "exchange-render: не зняв замок {}: {e}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+}
+
+/// Вік замка за mtime.
+///
+/// `None` означає «не змогли дізнатись» — файл щойно зник, годинник
+/// стрибнув назад, ФС не дає mtime. Тлумачимо на користь чужого замка:
+/// не знаємо віку — вважаємо живим і чекаємо. Помилитись у цей бік
+/// означає зачекати зайве; помилитись у протилежний — забрати замок
+/// у того, хто саме зараз пише.
+fn lock_age(path: &Path) -> Option<Duration> {
+    std::fs::metadata(path).ok()?.modified().ok()?.elapsed().ok()
+}
+
+/// Міжпроцесний замок без нових залежностей.
+///
+/// `create_new(true)` — це `O_EXCL` на POSIX і `CREATE_NEW` на Windows:
+/// перевірка «немає» і створення атомарні на рівні ядра, тож двох
+/// власників бути не може. Усередині файла лишається pid — щоб було видно,
+/// кого шукати, коли замок доведеться розбирати руками.
+fn acquire_lock_with(now_md: &Path, wait: Duration, stale: Duration) -> Result<LockGuard, Error> {
+    let path = lock_path_for(now_md);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let started = Instant::now();
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                // Замок уже наш — guard створюємо одразу, щоб навіть провал
+                // запису pid не лишив файл нічийним.
+                let guard = LockGuard { path };
+                let _ = writeln!(f, "{}", std::process::id());
+                return Ok(guard);
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                if lock_age(&path).is_some_and(|age| age >= stale) {
+                    eprintln!(
+                        "exchange-render: забираю протермінований замок {} (старший за {stale:?})",
+                        path.display()
+                    );
+                    match std::fs::remove_file(&path) {
+                        // Прибрали самі або нас випередили — обидва рази
+                        // йдемо по замок наново.
+                        Ok(()) => continue,
+                        Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                if started.elapsed() >= wait {
+                    return Err(Error::LockBusy { path, waited: wait });
+                }
+                std::thread::sleep(LOCK_POLL);
+            }
+            // Не «зайнято», а справжня біда: немає теки, немає прав, зник
+            // диск. Мовчки продовжувати без замка означало б повернути
+            // рівно ту гонку, заради якої він і зʼявився.
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use exchange_store::{Agent, Envelope, Op, Store};
     use std::fs;
+    use std::time::SystemTime;
     use tempfile::tempdir;
 
     fn sample_envelope(from: Agent, to: Agent, topic: &str, op: Op) -> Envelope {
@@ -2452,6 +2636,287 @@ mod tests {
             fs::read_to_string(&now).unwrap(),
             "рукопис людини, доповнений\n"
         );
+    }
+
+    // ==================================================================
+    // BUG-4: io-помилка, що не `NotFound`, більше не вдає «файла немає».
+    // BUG-3: міжпроцесний замок навколо циклу read -> merge -> write.
+    // ==================================================================
+
+    /// Байти, які точно не UTF-8: `read_to_string` дає на них
+    /// `InvalidData`, а от **запис** у такий файл проходить нормально.
+    ///
+    /// ⚠️ Саме цим сценарій і цінний. Перша спроба тестувала розвилку
+    /// через теку замість файла — і тест зеленів **і на баговій версії**:
+    /// там разом із читанням падав і запис, тож назовні в обох світах
+    /// приїжджав однаковий `Err`, а різницю (затерли рукопис чи ні)
+    /// побачити було ніде. Небезпечний живий випадок — delete-pending
+    /// після `MoveFileEx` — це «читання впало, запис вдався», і
+    /// невалідний UTF-8 відтворює саме його, детерміновано й на всіх ОС.
+    const NOT_UTF8: &[u8] = &[0x23, 0x20, 0xff, 0xfe, 0x00, 0x9c, 0x0a];
+
+    /// Пряма перевірка розвилки: не `NotFound` → `Err`, і саме той kind.
+    #[test]
+    fn read_existing_propagates_errors_other_than_not_found() {
+        let dir = tempdir().unwrap();
+
+        // 1. Невалідний UTF-8 → `InvalidData`, не `NotFound`.
+        let broken = dir.path().join("NOW.md");
+        fs::write(&broken, NOT_UTF8).unwrap();
+        match read_existing(&broken) {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), ErrorKind::InvalidData),
+            other => panic!("очікували Io(InvalidData), отримали {other:?}"),
+        }
+
+        // 2. Тека замість файла: kind різний на ОС, спільне — не `NotFound`.
+        let as_dir = dir.path().join("dir-NOW.md");
+        fs::create_dir(&as_dir).unwrap();
+        match read_existing(&as_dir) {
+            Err(Error::Io(e)) => assert_ne!(
+                e.kind(),
+                ErrorKind::NotFound,
+                "тека приїхала як NotFound — розвилка не та"
+            ),
+            other => panic!("очікували Io, отримали {other:?}"),
+        }
+
+        // 3. Файла немає — і тільки тут `None`, тобто дозвіл на каркас.
+        assert!(read_existing(&dir.path().join("немає.md")).unwrap().is_none());
+
+        // 4. Звичайний файл читається як був.
+        let ok = dir.path().join("ok.md");
+        fs::write(&ok, handwritten()).unwrap();
+        assert_eq!(read_existing(&ok).unwrap().as_deref(), Some(handwritten()));
+    }
+
+    /// Те саме наскрізь через `render` — на єдиному сценарії, де баг
+    /// видно: читання падає, а запис би вдався. З `.ok()` сюди лягає
+    /// каркас поверх наявних байтів; після правки байти незмінні.
+    #[test]
+    fn unreadable_now_md_is_not_overwritten_by_the_skeleton() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("exchange.db");
+        let store = Store::open(&db).unwrap();
+        store.lock("alpha", Agent::Grok, 90, "hold").unwrap();
+
+        let now = dir.path().join("NOW.md");
+        fs::write(&now, NOT_UTF8).unwrap();
+
+        let err = render(&store, &now).expect_err("render мав відмовитись");
+        match &err {
+            Error::Io(e) => assert_eq!(
+                e.kind(),
+                ErrorKind::InvalidData,
+                "помилка не з читання: {e:?}"
+            ),
+            other => panic!("очікували Io, отримали {other:?}"),
+        }
+
+        // Головне твердження: рукопис на диску побайтово той самий.
+        assert_eq!(
+            fs::read(&now).unwrap(),
+            NOT_UTF8.to_vec(),
+            "файл затерто попри нечитабельність — це і є BUG-4"
+        );
+        assert!(
+            !agent_talk_path(&now).exists(),
+            "agent_talk.md написано попри відмову"
+        );
+        assert!(
+            !lock_path_for(&now).exists(),
+            "замок лишився висіти після io-помилки"
+        );
+        assert_eq!(tmp_leftovers(dir.path()), Vec::<String>::new());
+    }
+
+    /// Друга гілка тієї самої розвилки: `NotFound` — і тільки він — досі
+    /// дає каркас. Інакше «полагодили» перетворилось би на «зламали».
+    #[test]
+    fn missing_file_still_gets_the_skeleton() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("exchange.db");
+        let now = dir.path().join("NOW.md");
+        assert!(!now.exists());
+
+        let store = Store::open(&db).unwrap();
+        store.lock("alpha", Agent::Grok, 90, "hold").unwrap();
+        render(&store, &now).unwrap();
+
+        let text = fs::read_to_string(&now).unwrap();
+        assert!(text.starts_with(HEADING), "немає заголовка: {text}");
+        for marker in [LOCK_BEGIN, LOCK_END, INBOX_BEGIN, INBOX_END] {
+            assert_eq!(text.matches(marker).count(), 1, "маркер {marker}");
+        }
+        assert!(text.contains("ttl=90"));
+    }
+
+    /// Регресія: замок нічого не змінив у результаті. Два послідовні
+    /// render на тому самому стані бази дають байт у байт те саме, що
+    /// давали до нього, і не лишають ані замка, ані tmp.
+    #[test]
+    fn two_serial_renders_under_the_lock_change_nothing() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("exchange.db");
+        let now = dir.path().join("NOW.md");
+        fs::write(&now, handwritten()).unwrap();
+
+        let store = Store::open(&db).unwrap();
+        store.lock("alpha", Agent::Grok, 90, "hold").unwrap();
+        store
+            .post(sample_envelope(Agent::Claude, Agent::Grok, "alpha", Op::Q))
+            .unwrap();
+
+        render(&store, &now).unwrap();
+        let first = fs::read(&now).unwrap();
+        let first_talk = fs::read(agent_talk_path(&now)).unwrap();
+
+        render(&store, &now).unwrap();
+        assert_eq!(fs::read(&now).unwrap(), first, "другий render зсунув байти");
+        assert_eq!(fs::read(agent_talk_path(&now)).unwrap(), first_talk);
+
+        // Очікуваний вміст рахуємо тим самим merge, але **без** замка —
+        // тобто рівно тим, що було до правки.
+        let expected = merge_now_md(
+            Some(handwritten()),
+            &build_lock_block(&store.locks().unwrap()),
+            &build_inbox_block(&store.inbox(Agent::Grok, false).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(first).unwrap(),
+            expected,
+            "результат під замком розійшовся з результатом без нього"
+        );
+
+        assert!(!lock_path_for(&now).exists(), "замок не знято");
+        assert_eq!(tmp_leftovers(dir.path()), Vec::<String>::new());
+    }
+
+    /// Свіжий чужий замок чекається до таймауту й **не** відбирається;
+    /// протермінований — забирається, і guard знімає його за собою.
+    #[test]
+    fn stale_lock_is_reclaimed_and_fresh_one_is_waited_for() {
+        let dir = tempdir().unwrap();
+        let now = dir.path().join("NOW.md");
+        let lock = lock_path_for(&now);
+        assert_eq!(lock, dir.path().join(".NOW.md.lock"), "замок не при файлі");
+
+        // Чужий процес тримає замок. Він свіжий, тож ми його не чіпаємо.
+        fs::write(&lock, "424242\n").unwrap();
+        let wait = Duration::from_millis(120);
+        let started = Instant::now();
+        let err = acquire_lock_with(&now, wait, LOCK_STALE)
+            .expect_err("свіжий чужий замок не мав дістатись нам");
+        match &err {
+            Error::LockBusy { path, waited } => {
+                assert_eq!(path.as_path(), lock.as_path());
+                assert_eq!(*waited, wait);
+            }
+            other => panic!("очікували LockBusy, отримали {other:?}"),
+        }
+        assert!(
+            started.elapsed() >= wait,
+            "здались раніше за таймаут: {:?}",
+            started.elapsed()
+        );
+        assert!(lock.exists(), "чужий свіжий замок усе-таки прибрано");
+
+        // Той самий замок, зістарений на хвилину: власника вже немає,
+        // і без цієї гілки обмін заклинило б назавжди.
+        let f = fs::File::options().write(true).open(&lock).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(60))
+            .unwrap();
+        drop(f);
+
+        let guard = acquire_lock_with(&now, wait, LOCK_STALE)
+            .expect("протермінований замок мав бути забраний");
+        assert!(lock.exists(), "взятий замок мусить лежати на диску");
+        drop(guard);
+        assert!(!lock.exists(), "guard не зняв замок за собою");
+    }
+
+    /// Замок знімається й тоді, коли merge відмовився: інакше один
+    /// зламаний NOW.md вішав би обмін на тридцять секунд щоразу.
+    #[test]
+    fn lock_is_released_when_merge_refuses() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("exchange.db");
+        let now = dir.path().join("NOW.md");
+        fs::write(
+            &now,
+            format!("{HEADING}\n\n{LOCK_BEGIN}\nзламано\n## Головне\nтримати\n"),
+        )
+        .unwrap();
+
+        let store = Store::open(&db).unwrap();
+        refuses_and_keeps_bytes(&now, &store);
+
+        assert!(
+            !lock_path_for(&now).exists(),
+            "замок лишився після відмови merge"
+        );
+
+        // І наступний виклик не впирається в чужий замок — він таки знятий.
+        refuses_and_keeps_bytes(&now, &store);
+    }
+
+    /// Головний тест BUG-3: `render` **не заходить у цикл**, поки файл
+    /// тримає інший процес.
+    ///
+    /// ⚠️ Без нього решта тестів замка мала діру: усі вони перевіряють,
+    /// що замка після роботи **немає** — а якби `render` не брав його
+    /// зовсім, вони так само зеленіли б. Тут навпаки: чужий замок лежить
+    /// на місці, і єдиний спосіб пройти — справді на нього спіткнутись.
+    #[test]
+    fn render_refuses_while_someone_else_holds_the_lock() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("exchange.db");
+        let now = dir.path().join("NOW.md");
+        fs::write(&now, handwritten()).unwrap();
+
+        let store = Store::open(&db).unwrap();
+        store.lock("alpha", Agent::Grok, 90, "hold").unwrap();
+
+        // Чужий процес узяв замок і ще нічого не дописав.
+        let held = acquire_lock_with(&now, Duration::from_millis(50), LOCK_STALE)
+            .expect("вільний замок мав дістатись нам");
+
+        let wait = Duration::from_millis(120);
+        let started = Instant::now();
+        let err = render_with(&store, &now, wait, LOCK_STALE)
+            .expect_err("render поліз у файл попри чужий замок");
+        match &err {
+            Error::LockBusy { path, waited } => {
+                assert_eq!(path.as_path(), lock_path_for(&now).as_path());
+                assert_eq!(*waited, wait);
+            }
+            other => panic!("очікували LockBusy, отримали {other:?}"),
+        }
+        assert!(started.elapsed() >= wait, "здались раніше за таймаут");
+
+        // Поки чужий тримає — наш render не змінив ані байта.
+        assert_eq!(fs::read_to_string(&now).unwrap(), handwritten());
+        assert!(!agent_talk_path(&now).exists(), "agent_talk.md написано");
+
+        // Щойно власник відпустив — той самий виклик проходить.
+        drop(held);
+        render_with(&store, &now, wait, LOCK_STALE).expect("замок звільнено, а render не пройшов");
+        assert!(fs::read_to_string(&now).unwrap().contains("ttl=90"));
+        assert!(!lock_path_for(&now).exists(), "замок не знято після успіху");
+    }
+
+    /// Журнали проєкту не пишуться — отже й замка при них не заводимо.
+    #[test]
+    fn log_md_takes_no_lock() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("exchange.db");
+        let log = dir.path().join("xvid-log.md");
+
+        let store = Store::open(&db).unwrap();
+        render(&store, &log).unwrap();
+
+        assert!(!lock_path_for(&log).exists(), "замок при журналі проєкту");
+        assert!(!log.exists());
     }
 
     #[test]
