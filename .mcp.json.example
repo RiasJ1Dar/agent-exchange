@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "agent-exchange": {
+      "command": "/повний/шлях/до/agent-exchange/target/release/exchange-mcp",
+      "env": {
+        "AGENT_NAME": "Claude"
+      }
+    }
+  }
+}
