@@ -1,12 +1,25 @@
-use exchange_store::{Agent, Lock, Message, Op, Store};
-use serde::Serialize;
-use std::borrow::Cow;
-use std::fmt::Write as FmtWrite;
+use exchange_store::{Agent, Store};
 use std::io::ErrorKind;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+mod merge;
+mod talk;
+
+use merge::{build_inbox_block, build_lock_block, merge_now_md};
+use talk::{agent_talk_path, build_agent_talk};
+
+#[cfg(test)]
+use std::borrow::Cow;
+#[cfg(test)]
+pub(crate) use merge::{
+    dominant_eol, read_in_db_line, sanitize, to_eol, CRLF, HEADING, INBOX_BEGIN, INBOX_END,
+    INBOX_UNREAD_LIMIT, LF, LOCK_BEGIN, LOCK_END, NO_QUESTIONS_LINE, UNREAD_MARK,
+};
+#[cfg(test)]
+pub(crate) use talk::{TALK_HEADER, TALK_NAME};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -38,22 +51,6 @@ pub struct RenderOpts<'a> {
     /// API, не в межах косметичної правки.
     pub board_dir: &'a Path,
 }
-
-/// Маркери вставок. Контракт узгоджений — не міняти.
-const LOCK_BEGIN: &str = "<!-- exchange:lock -->";
-const LOCK_END: &str = "<!-- /exchange:lock -->";
-const INBOX_BEGIN: &str = "<!-- exchange:inbox -->";
-const INBOX_END: &str = "<!-- /exchange:inbox -->";
-const HEADING: &str = "# Зараз";
-
-/// Імʼя машинного файла обміну — сусід `now_md` у тій самій теці.
-const TALK_NAME: &str = "agent_talk.md";
-
-/// Шапка `agent_talk.md`: два рядки для людини, далі самі JSON-рядки.
-const TALK_HEADER: &str = concat!(
-    "# agent_talk — дріт агентів. Файл ГЕНЕРОВАНИЙ, правки руками зникнуть.\n",
-    "# Формат: один JSON на рядок. Людині сюди дивитись не треба — див. NOW.md.\n"
-);
 
 pub fn render_now(opts: RenderOpts<'_>) -> Result<(), Error> {
     if is_log_md(opts.now_md) {
@@ -104,6 +101,9 @@ fn render_with(
 
 fn render_locked(store: &Store, now_md: &Path) -> Result<(), Error> {
     let locks = store.locks()?;
+    // Повна вибірка: `agent_talk.md` — журнал, а лічильник
+    // `ще M прочитаних` рахує ack-нуті. Стеля непрочитаних живе
+    // уже в `build_inbox_block`, не в SQL.
     let mut msgs = store.inbox(Agent::Grok, false)?;
     let extra = store.inbox(Agent::Claude, false)?;
     for m in extra {
@@ -163,475 +163,6 @@ fn read_existing(now_md: &Path) -> Result<Option<String>, Error> {
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
-}
-
-/// `agent_talk.md` поруч із `now_md`.
-fn agent_talk_path(now_md: &Path) -> PathBuf {
-    now_md.with_file_name(TALK_NAME)
-}
-
-/// Один рядок машинного журналу. Порядок полів заданий структурою, а не
-/// мапою: `serde_json` без `preserve_order` сортує ключі `Map` алфавітно,
-/// і формат «як домовились» розсипався б.
-#[derive(Serialize)]
-struct TalkLine<'a> {
-    id: i64,
-    ts: i64,
-    from: Agent,
-    to: Agent,
-    topic: &'a str,
-    op: Op,
-    read: bool,
-    body: &'a serde_json::Value,
-}
-
-/// Увесь обмін: шапка, далі по одному компактному JSON на рядок,
-/// найновіше знизу (`msgs` уже відсортовані за `id`).
-///
-/// Санітизації тут свідомо немає: `serde_json` сам екранує все, що могло б
-/// зламати рядок, а маркерів у цьому файлі не буває. Єдина вимога до
-/// формату — кожен рядок після шапки лишається валідним JSON.
-fn build_agent_talk(msgs: &[Message]) -> String {
-    let mut s = String::from(TALK_HEADER);
-    for m in msgs {
-        let line = TalkLine {
-            id: m.id,
-            ts: m.ts_unix,
-            from: m.envelope.from,
-            to: m.envelope.to,
-            topic: &m.envelope.topic,
-            op: m.envelope.op,
-            read: m.read_at.is_some(),
-            body: &m.envelope.body,
-        };
-        match serde_json::to_string(&line) {
-            Ok(json) => {
-                s.push_str(&json);
-                s.push('\n');
-            }
-            // Тіло приїхало з бази вже розібраним, тож сюди не потрапити.
-            // Але навіть у цьому разі рядок мусить лишитись валідним JSON,
-            // інакше формат ламається для всіх, хто читає файл машиною.
-            Err(_) => {
-                let _ = writeln!(&mut s, "{{\"id\":{},\"error\":\"serialize\"}}", m.id);
-            }
-        }
-    }
-    s
-}
-
-/// Санітизація вмісту, що приходить **із бази**, на межі запису у файл.
-///
-/// Агенти буквально пишуть одне одному про маркери, тож справжня
-/// послідовність `-->` цілком може приїхати в темі, нотатці чи тілі
-/// повідомлення. Потрапивши в згенерований блок дослівно, вона добудовує
-/// другий закривний маркер: наступний render обірве блок на підробці, а
-/// хвіст файлу лишиться сміттям. Суворий контракт маркерів тут не рятує —
-/// інʼєкція робить пару формально валідною.
-///
-/// Рішення людини (D2) — **видима** заміна `-->` → `--&gt;`, а не
-/// нуль-ширинний символ: файл читають очима й копіюють в інші місця, тому
-/// невидима підміна була б пасткою. Ціна свідома: текст у файлі
-/// відрізняється від надісланого, і це має бути помітно.
-///
-/// Одного `-->` досить, щоб знешкодити всі чотири маркери: кожен із них
-/// закінчується саме цією послідовністю.
-fn sanitize(s: &str) -> String {
-    s.replace("-->", "--&gt;")
-}
-
-fn build_lock_block(locks: &[Lock]) -> String {
-    let mut s = String::new();
-    s.push_str(LOCK_BEGIN);
-    s.push_str("\n## Замок\n\n");
-    if locks.is_empty() {
-        s.push_str("- (немає)\n");
-    }
-    for l in locks {
-        let _ = writeln!(
-            &mut s,
-            "- {} {} ttl={} taken_at={} {}",
-            sanitize(&l.topic),
-            l.holder,
-            l.ttl_sec,
-            l.taken_at,
-            sanitize(&l.note)
-        );
-    }
-    s.push('\n');
-    s.push_str(LOCK_END);
-    s
-}
-
-/// Три числа непрочитаного замість одного.
-///
-/// Одне число нічого не означало. На живій дошці воно писало «Claude — 41»,
-/// і з тих сорока одного питань (`op = Q`) було рівно два, а решта — статуси
-/// на `Both` («w2-ok», «apk 15.74 MB»). Сорок один звучить як катастрофа,
-/// два — як робота на пʼять хвилин; саме тому лічильник почали ігнорувати.
-/// Розділяємо за тим, що вимагає дії:
-///
-/// 1. **питання без відповіді** — непрочитані `op = Q`;
-/// 2. **особисті** — непрочитані з конкретним адресатом (`to != Both`),
-///    крім уже порахованих питань;
-/// 3. **широкомовні** — решта непрочитаних (`to = Both`, `op != Q`).
-///
-/// `Both` як адресат рахується обом — рівно так само, як це робить
-/// `Store::inbox` із `unread_only`, тож питання на `Both` стоїть у черзі
-/// в обох. Через це широкомовних одне число, а не пара: такі повідомлення
-/// лежать в обох скриньках однаково, і розписувати їх «Grok — 31,
-/// Claude — 31» означало б удвічі роздути ту саму купу.
-///
-/// Рахуємо на вже зібраному зрізі, щоб не ходити в базу вдруге й не
-/// залежати від того, що там міняється паралельно.
-#[derive(Default)]
-struct Unread {
-    q_grok: usize,
-    q_claude: usize,
-    personal_grok: usize,
-    personal_claude: usize,
-    broadcast: usize,
-}
-
-impl Unread {
-    /// Черга питань порожня — рядок має сказати це спокійно, без ⚠️.
-    fn no_questions(&self) -> bool {
-        self.q_grok == 0 && self.q_claude == 0
-    }
-}
-
-fn tally_unread(msgs: &[Message]) -> Unread {
-    let mut t = Unread::default();
-    for m in msgs.iter().filter(|m| m.read_at.is_none()) {
-        let to = m.envelope.to;
-        if m.envelope.op == Op::Q {
-            // Питання перебиває адресата: `Q` на `Both` — це питання
-            // обом, а не широкомовний статус.
-            if to == Agent::Grok || to == Agent::Both {
-                t.q_grok += 1;
-            }
-            if to == Agent::Claude || to == Agent::Both {
-                t.q_claude += 1;
-            }
-            continue;
-        }
-        match to {
-            Agent::Grok => t.personal_grok += 1,
-            Agent::Claude => t.personal_claude += 1,
-            Agent::Both => t.broadcast += 1,
-        }
-    }
-    t
-}
-
-/// Позначка непрочитаного в мічених полях рядка inbox.
-///
-/// Раніше час прочитання йшов останнім і **без назви**, а непрочитане
-/// давало голий `-`. У списку, де кожен рядок і так починається з `- `,
-/// такий дефіс читався як другий списковий маркер, а не як «немає часу».
-const UNREAD_MARK: &str = "непрочитане";
-
-/// Рядок порожньої черги питань.
-///
-/// Окремим текстом, а не «Grok — 0, Claude — 0» зі знаком тривоги: нуль
-/// питань — це нормальний стан, і виглядати він має спокійно. ⚠️ у файлі,
-/// який читають щодня, працює лише поки не стоїть там завжди.
-const NO_QUESTIONS_LINE: &str = "- питань без відповіді немає";
-
-fn op_str(op: Op) -> &'static str {
-    match op {
-        Op::Q => "Q",
-        Op::A => "A",
-        Op::N => "N",
-        Op::L => "L",
-    }
-}
-
-/// Блок inbox у NOW.md — **підсумок, а не журнал**.
-///
-/// Заміряно на живій дошці: повний список з'їдав 176 рядків із 262, тобто
-/// дві третини файла, який людина читає очима, і ліміту в нього не було —
-/// друкувались усі повідомлення, і прочитані теж. Рішення людини: журнал
-/// переїхав у `agent_talk.md`, а тут лишаються числа й вказівник.
-///
-/// Маркери на місці — контракт вставок не змінився, змінився лише вміст
-/// між ними. Тема останнього повідомлення все ще проходить `sanitize`:
-/// вона потрапляє у файл із маркерами, отже інʼєкція `-->` тут так само
-/// небезпечна, як була.
-fn build_inbox_block(msgs: &[Message]) -> String {
-    let mut s = String::new();
-    s.push_str(INBOX_BEGIN);
-    s.push_str("\n## Inbox\n\n");
-
-    // Порядок рядків = порядок важливості: питання першими й помітно,
-    // широкомовні останніми й тихо, одним числом у спільному рядку.
-    let t = tally_unread(msgs);
-    if t.no_questions() {
-        s.push_str(NO_QUESTIONS_LINE);
-        s.push('\n');
-    } else {
-        let _ = writeln!(
-            &mut s,
-            "- ⚠️ питань без відповіді: Grok — {}, Claude — {}",
-            t.q_grok, t.q_claude
-        );
-    }
-    let _ = writeln!(
-        &mut s,
-        "- особистих непрочитаних: Grok — {}, Claude — {}",
-        t.personal_grok, t.personal_claude
-    );
-    let _ = writeln!(
-        &mut s,
-        "- широкомовних: {} · усього повідомлень {}",
-        t.broadcast,
-        msgs.len()
-    );
-
-    match msgs.last() {
-        None => s.push_str("- (немає)\n"),
-        Some(m) => {
-            // Кожне поле з назвою: `read_at` тепер теж, а замість голого
-            // дефіса для непрочитаного стоїть слово.
-            let read_at = match m.read_at {
-                Some(t) => t.to_string(),
-                None => UNREAD_MARK.to_string(),
-            };
-            let _ = writeln!(
-                &mut s,
-                "- останнє: #{} {}→{} {} {} ts_unix={} read_at={}",
-                m.id,
-                m.envelope.from,
-                m.envelope.to,
-                sanitize(&m.envelope.topic),
-                op_str(m.envelope.op),
-                m.ts_unix,
-                read_at
-            );
-        }
-    }
-
-    let _ = writeln!(
-        &mut s,
-        "- повний обмін — {TALK_NAME} (машинний, один JSON на рядок)"
-    );
-
-    s.push('\n');
-    s.push_str(INBOX_END);
-    s
-}
-
-const LF: &str = "\n";
-const CRLF: &str = "\r\n";
-
-/// Який перенос рядка переважає в наявному файлі.
-///
-/// Рахуємо `\r\n` проти **всіх** `\n`: файл вважається CRLF-овим лише коли
-/// таких переносів більшість (`2 * crlf > усі`). Мішанина з перевагою LF —
-/// це LF, і тоді генерація йде колишнім шляхом, без жодного перетворення,
-/// тож LF-файл лишається байт у байт таким, як був.
-///
-/// Навіщо взагалі: блоки будуються з `\n`, і в CRLF-файлі вставка давала
-/// змішаний EOL. Файл після цього ламався в інструментах, що ріжуть текст
-/// саме по `\r\n`, а людина бачила зайвий розрив перед наступним розділом.
-fn dominant_eol(text: &str) -> &'static str {
-    let crlf = text.matches(CRLF).count();
-    let all = text.matches('\n').count();
-    if crlf * 2 > all {
-        CRLF
-    } else {
-        LF
-    }
-}
-
-/// Переводить згенерований текст (він завжди `\n`-термінований) у EOL файла.
-///
-/// Для LF це тотожність без жодної алокації — саме тому LF-файл не може
-/// змінитись навіть на байт. Для CRLF спершу згортаємо вже наявні `\r\n`
-/// назад у `\n`: у блок потрапляє текст із бази (тема, нотатка), і там
-/// цілком може лежати справжній `\r\n`. Без згортання вийшло б `\r\r\n`.
-fn to_eol<'a>(s: &'a str, eol: &'static str) -> Cow<'a, str> {
-    if eol == LF {
-        Cow::Borrowed(s)
-    } else {
-        Cow::Owned(s.replace(CRLF, LF).replace('\n', CRLF))
-    }
-}
-
-fn strip_bom(s: &str) -> (bool, &str) {
-    match s.strip_prefix('\u{feff}') {
-        Some(rest) => (true, rest),
-        None => (false, s),
-    }
-}
-
-/// Півінтервал байтів `[begin_pos, end_pos_включно_з_end)` однієї пари маркерів.
-type Span = (usize, usize);
-
-/// Класифікує один вид маркера в уже знятому з BOM тексті.
-///
-/// * `Ok(None)` — маркерів цього виду немає зовсім;
-/// * `Ok(Some(span))` — рівно одна коректна пара;
-/// * `Err(reason)` — будь-що інше: дублі, непарний, закривний перед відкривним.
-fn classify_marker(text: &str, begin: &str, end: &str) -> Result<Option<Span>, String> {
-    let nb = text.matches(begin).count();
-    let ne = text.matches(end).count();
-
-    match (nb, ne) {
-        (0, 0) => Ok(None),
-        (1, 1) => {
-            let b = text.find(begin).expect("щойно порахований відкривний");
-            let e = text.find(end).expect("щойно порахований закривний");
-            if b < e {
-                Ok(Some((b, e + end.len())))
-            } else {
-                Err(format!(
-                    "закривний маркер {end} стоїть раніше за відкривний {begin}"
-                ))
-            }
-        }
-        (1, 0) => Err(format!(
-            "непарний відкривний маркер {begin}: закривного {end} немає"
-        )),
-        (0, 1) => Err(format!(
-            "непарний закривний маркер {end}: відкривного {begin} немає"
-        )),
-        _ => Err(format!(
-            "маркер має траплятись рівно раз: {begin} — {nb}, {end} — {ne}"
-        )),
-    }
-}
-
-/// Зшиває нові вставки з наявним файлом. Перед будь-якою правкою файл
-/// класифікується, і працюємо лише у двох станах:
-///
-/// * **рівно одна коректна пара** кожного виду, діапазони не перетинаються
-///   → міняється лише вміст між маркерами;
-/// * **жодного маркера** (обидва види відсутні) → блоки вставляються після
-///   першого рядка `# Зараз` (а якщо заголовка немає — на початок).
-///
-/// Файла немає або він порожній → мінімальний каркас `# Зараз` + два блоки.
-/// Будь-який інший стан — `Err(reason)`, файл не чіпається.
-fn merge_now_md(
-    existing: Option<&str>,
-    lock_block: &str,
-    inbox_block: &str,
-) -> Result<String, String> {
-    let skeleton = |eol: &'static str| {
-        let lock = to_eol(lock_block, eol);
-        let inbox = to_eol(inbox_block, eol);
-        format!("{HEADING}{eol}{eol}{lock}{eol}{eol}{inbox}{eol}")
-    };
-
-    let Some(raw) = existing else {
-        // Файла ще немає — переймати EOL нема в кого, пишемо LF.
-        return Ok(skeleton(LF));
-    };
-    let (bom, text) = strip_bom(raw);
-    let eol = dominant_eol(text);
-
-    // Порожній наявний файл рівносильний відсутньому: інакше він назавжди
-    // лишався б без `# Зараз`.
-    if text.trim().is_empty() {
-        return Ok(with_bom(bom, skeleton(eol)));
-    }
-
-    // Далі блоки йдуть уже в переносі файла. Для LF `to_eol` — тотожність,
-    // тож і байти лишаються ті самі.
-    let lock_block = to_eol(lock_block, eol);
-    let inbox_block = to_eol(inbox_block, eol);
-
-    let lock = classify_marker(text, LOCK_BEGIN, LOCK_END)?;
-    let inbox = classify_marker(text, INBOX_BEGIN, INBOX_END)?;
-
-    let out = match (lock, inbox) {
-        (Some(l), Some(i)) => {
-            if l.1 > i.0 && i.1 > l.0 {
-                return Err("діапазони exchange:lock та exchange:inbox перетинаються".to_string());
-            }
-            replace_two_spans(text, l, &lock_block, i, &inbox_block)
-        }
-        (None, None) => {
-            let insert = format!("{lock_block}{eol}{eol}{inbox_block}{eol}{eol}");
-            insert_after_heading(text, &insert, eol)
-        }
-        (Some(_), None) => {
-            return Err(
-                "змішаний стан: пара exchange:lock є, а exchange:inbox немає зовсім".to_string(),
-            )
-        }
-        (None, Some(_)) => {
-            return Err(
-                "змішаний стан: пара exchange:inbox є, а exchange:lock немає зовсім".to_string(),
-            )
-        }
-    };
-
-    Ok(with_bom(bom, out))
-}
-
-fn with_bom(bom: bool, out: String) -> String {
-    if bom {
-        format!("\u{feff}{out}")
-    } else {
-        out
-    }
-}
-
-/// Міняє вміст двох діапазонів, що не перетинаються, на готові блоки.
-/// Усе поза ними — байт у байт як було.
-fn replace_two_spans(
-    text: &str,
-    lock: Span,
-    lock_block: &str,
-    inbox: Span,
-    inbox_block: &str,
-) -> String {
-    let (first, first_block, second, second_block) = if lock.0 < inbox.0 {
-        (lock, lock_block, inbox, inbox_block)
-    } else {
-        (inbox, inbox_block, lock, lock_block)
-    };
-
-    let mut out = String::with_capacity(text.len() + lock_block.len() + inbox_block.len());
-    out.push_str(&text[..first.0]);
-    out.push_str(first_block);
-    out.push_str(&text[first.1..second.0]);
-    out.push_str(second_block);
-    out.push_str(&text[second.1..]);
-    out
-}
-
-/// Індекс байта одразу після рядка `# Зараз`; 0, якщо такого рядка немає.
-fn heading_end(text: &str) -> usize {
-    let mut idx = 0usize;
-    for line in text.split_inclusive('\n') {
-        if line.trim() == HEADING {
-            return idx + line.len();
-        }
-        idx += line.len();
-    }
-    0
-}
-
-/// Вставляє блоки після заголовка. Порожній рядок-роздільник ставиться
-/// переносом самого файла (`eol`), інакше в CRLF-файлі з'являвся самотній
-/// `\n` — той самий змішаний EOL, що й ламав вигляд наступного розділу.
-fn insert_after_heading(text: &str, insert: &str, eol: &str) -> String {
-    let pos = heading_end(text);
-    let (head, tail) = text.split_at(pos);
-
-    let mut out = String::with_capacity(text.len() + insert.len() + 2 * eol.len());
-    out.push_str(head);
-    if !head.is_empty() {
-        if !head.ends_with('\n') {
-            out.push_str(eol);
-        }
-        out.push_str(eol);
-    }
-    out.push_str(insert);
-    out.push_str(tail);
-    out
 }
 
 fn is_log_md(path: &Path) -> bool {
@@ -901,7 +432,6 @@ mod tests {
         let id = store
             .post(sample_envelope(Agent::Claude, Agent::Grok, "alpha", Op::Q))
             .unwrap();
-        store.ack(id).unwrap();
 
         render(&store, &now).unwrap();
 
@@ -917,19 +447,13 @@ mod tests {
         // і вказівник на машинний файл.
         assert!(!text.contains("```json"), "тіло лишилось у NOW.md: {text}");
         assert!(text.contains("особистих непрочитаних:"));
-        // Єдине повідомлення ack-нуте, тож черга питань порожня — і рядок
-        // про це має бути спокійний.
         assert!(
-            text.contains(NO_QUESTIONS_LINE),
-            "немає тихого рядка: {text}"
+            text.contains(&format!("read_at={UNREAD_MARK}")),
+            "непрочитане без позначки: {text}"
         );
-        assert!(!text.contains('⚠'), "тривога на порожній черзі: {text}");
-        // P0-R4: час прочитання йде з назвою. Повідомлення тут ack-нуте,
-        // тож у рядку має стояти число, а не позначка непрочитаного.
-        assert!(text.contains("read_at="), "немає мітки read_at: {text}");
         assert!(
-            !text.contains(UNREAD_MARK),
-            "ack-нуте показане як непрочитане: {text}"
+            !text.contains(&read_in_db_line(1)),
+            "лічильник прочитаних на порожній базі: {text}"
         );
         assert!(text.contains(TALK_NAME));
         assert!(!now.to_string_lossy().contains("agent-board"));
@@ -1438,7 +962,8 @@ mod tests {
         assert!(!to_eol("з бази\r\nдалі\n", CRLF).contains("\r\r"));
     }
 
-    /// Час прочитання має назву, а непрочитане — слово, а не голий дефіс.
+    /// Непрочитане в рядку — слово, а не голий дефіс; після ack рядок
+    /// зникає з маркера, лишається лічильник.
     #[test]
     fn inbox_last_line_labels_read_at() {
         let dir = tempdir().unwrap();
@@ -1462,33 +987,27 @@ mod tests {
             !block.contains(" -\n") && !block.contains(" -\r\n"),
             "рядок усе ще закінчується голим дефісом: {block}"
         );
+        let ts = block.find("ts_unix=").expect("ts_unix");
+        let ra = block.find("read_at=").expect("read_at");
+        assert!(ts < ra, "read_at виїхав уперед: {block}");
 
         store.ack(id).unwrap();
         render(&store, &now).unwrap();
 
-        let read_at = store
-            .inbox(Agent::Grok, false)
-            .unwrap()
-            .into_iter()
-            .find(|m| m.id == id)
-            .expect("повідомлення на місці")
-            .read_at
-            .expect("ack мав проставити час");
-
         let text = fs::read_to_string(&now).unwrap();
         let block = &text[text.find(INBOX_BEGIN).unwrap()..text.find(INBOX_END).unwrap()];
         assert!(
-            block.contains(&format!("read_at={read_at}")),
-            "немає часу прочитання з назвою: {block}"
+            !block.contains(&format!("#{id}")),
+            "прочитане лишилось у маркері: {block}"
+        );
+        assert!(
+            block.contains(&read_in_db_line(1)),
+            "немає лічильника прочитаних: {block}"
         );
         assert!(
             !block.contains(UNREAD_MARK),
             "прочитане показане як непрочитане: {block}"
         );
-        // Порядок мічених полів не змінився: read_at іде після ts_unix.
-        let ts = block.find("ts_unix=").expect("ts_unix");
-        let ra = block.find("read_at=").expect("read_at");
-        assert!(ts < ra, "read_at виїхав уперед: {block}");
     }
 
     // ==================================================================
@@ -1642,38 +1161,122 @@ mod tests {
         let text = fs::read_to_string(&now).unwrap();
         let block = &text[text.find(INBOX_BEGIN).unwrap()..text.find(INBOX_END).unwrap()];
 
-        // Прочитане не рахується. Єдине питання (`alpha`, Op::Q) ack-нуте,
-        // тож черга питань порожня; `beta` — особисте Grokові; `gamma` на
-        // `Both` — широкомовне, а не особисте.
+        // Прочитане не рахується в числах і не стоїть у списку. Єдине
+        // питання (`alpha`, Op::Q) ack-нуте, тож черга питань порожня;
+        // `beta` — особисте Grokові; `gamma` на `Both` — широкомовне.
         assert!(block.contains(NO_QUESTIONS_LINE), "не тиха черга: {block}");
         assert!(
             block.contains("особистих непрочитаних: Grok — 1, Claude — 0"),
             "не ті числа особистих: {block}"
         );
         assert!(
-            block.contains("широкомовних: 1 · усього повідомлень 3"),
+            block.contains("широкомовних: 1"),
             "не той підсумок: {block}"
         );
-        assert!(block.contains(&format!("- останнє: #{last}")), "{block}");
+        assert!(
+            !block.contains(&format!("#{read_one}")),
+            "прочитане в списку: {block}"
+        );
+        assert!(block.contains(&format!("#{last}")), "{block}");
         assert!(block.contains("ts_unix="), "{block}");
-        // P0-R4: останнє повідомлення тут непрочитане — і це видно словом,
-        // а не голим дефісом у кінці рядка.
         assert!(
             block.contains(&format!("read_at={UNREAD_MARK}")),
             "немає позначки непрочитаного: {block}"
         );
+        assert!(
+            block.contains(&read_in_db_line(1)),
+            "немає лічильника прочитаних: {block}"
+        );
         assert!(block.contains(TALK_NAME), "немає вказівника: {block}");
 
-        // Тіл немає, і блок лишився коротким.
+        // Тіл немає.
         assert!(!block.contains("```json"), "{block}");
         assert!(!block.contains("\"k\""), "тіло просочилось: {block}");
-        // Пʼять рядків підсумку (три лічильники, останнє, вказівник) —
-        // і жодного «на повідомлення».
+    }
+
+    /// R2: сорок повідомлень, частина ack — у маркері ≤ 15 непрочитаних,
+    /// рукопис байт у байт, прочитані згорнуті в один рядок лічильника.
+    #[test]
+    fn forty_messages_cap_inbox_at_fifteen_unread_and_keep_handwriting() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("exchange.db");
+        let now = dir.path().join("NOW.md");
+        fs::write(&now, handwritten()).unwrap();
+
+        let store = Store::open(&db).unwrap();
+        render(&store, &now).unwrap();
+        let first = fs::read_to_string(&now).unwrap();
+
+        let mut ids = Vec::with_capacity(40);
+        for i in 0..40 {
+            let op = if i % 7 == 0 { Op::Q } else { Op::N };
+            let id = store
+                .post(sample_envelope(
+                    Agent::Claude,
+                    Agent::Grok,
+                    &format!("m{i}"),
+                    op,
+                ))
+                .unwrap();
+            ids.push(id);
+        }
+        // 10 прочитаних, 30 непрочитаних — стеля має відрізати хвіст.
+        for id in &ids[..10] {
+            store.ack(*id).unwrap();
+        }
+
+        render(&store, &now).unwrap();
+        let text = fs::read_to_string(&now).unwrap();
+        handwriting_survives(&text, "40 повідомлень");
         assert_eq!(
-            block.lines().filter(|l| l.starts_with("- ")).count(),
-            5,
-            "блок inbox знову розрісся: {block}"
+            outside_blocks(&first),
+            outside_blocks(&text),
+            "стеля inbox зачепила рукопис"
         );
+
+        let block = &text[text.find(INBOX_BEGIN).unwrap()..text.find(INBOX_END).unwrap()];
+        let listed: Vec<&str> = block
+            .lines()
+            .filter(|l| l.starts_with("- #"))
+            .collect();
+        assert!(
+            listed.len() <= INBOX_UNREAD_LIMIT,
+            "у зрізі {} непрочитаних, стеля {INBOX_UNREAD_LIMIT}: {block}",
+            listed.len()
+        );
+        assert_eq!(
+            listed.len(),
+            INBOX_UNREAD_LIMIT,
+            "мали показати рівно стелю найновіших: {block}"
+        );
+
+        let hidden_unread = &ids[10..ids.len() - INBOX_UNREAD_LIMIT];
+        let shown_unread = &ids[ids.len() - INBOX_UNREAD_LIMIT..];
+        for id in &ids[..10] {
+            assert!(
+                !block.contains(&format!("- #{id} ")),
+                "прочитане #{id} у маркері: {block}"
+            );
+        }
+        for id in hidden_unread {
+            assert!(
+                !block.contains(&format!("- #{id} ")),
+                "старе непрочитане #{id} пройшло стелю: {block}"
+            );
+        }
+        for id in shown_unread {
+            assert!(
+                block.contains(&format!("- #{id} ")),
+                "немає найновішого #{id}: {block}"
+            );
+        }
+
+        assert!(
+            block.contains(&read_in_db_line(10)),
+            "немає лічильника прочитаних: {block}"
+        );
+        assert!(!block.contains("```json"), "тіло лишилось у NOW.md: {block}");
+        assert_eq!(parsed_talk(&now).len(), 40, "журнал зрізали разом із дошкою");
     }
 
     /// Головний випадок, заради якого лічильник розділено: три питання
@@ -1722,7 +1325,7 @@ mod tests {
             "питання загубились: {block}"
         );
         assert!(
-            block.contains("широкомовних: 10 · усього повідомлень 13"),
+            block.contains("широкомовних: 10"),
             "13 замість 3 і 10: {block}"
         );
         // `Both` ніколи не особисте.
@@ -1784,7 +1387,7 @@ mod tests {
             "не ті числа особистих: {block}"
         );
         assert!(
-            block.contains("широкомовних: 1 · усього повідомлень 3"),
+            block.contains("широкомовних: 1"),
             "Both не порахувалось широкомовним: {block}"
         );
     }
@@ -1855,9 +1458,10 @@ mod tests {
             "немає нулів: {block}"
         );
         assert!(block.contains(NO_QUESTIONS_LINE), "{block}");
+        assert!(block.contains("широкомовних: 0"), "{block}");
         assert!(
-            block.contains("широкомовних: 0 · усього повідомлень 0"),
-            "{block}"
+            !block.contains("прочитаних у базі"),
+            "лічильник на порожній базі: {block}"
         );
         assert!(block.contains("- (немає)"), "{block}");
     }
