@@ -8,8 +8,8 @@ mod locks;
 pub use error::Error;
 pub use schema::{SCHEMA, SCHEMA_VERSION};
 pub use messages::{
-    Agent, Envelope, InboxQuery, Message, Op, BRIEF_MARK, GC_INTERVAL_SEC,
-    GC_READ_TTL_SEC, MAX_BODY_CHARS,
+    Agent, Envelope, InboxQuery, Message, Op, BRIEF_MARK, BROADCAST, BROADCAST_LEGACY,
+    GC_INTERVAL_SEC, GC_READ_TTL_SEC, MAX_BODY_CHARS,
 };
 pub use locks::{
     normalize_topic, Evicted, Lock, LockOutcome, MAX_NOTE_CHARS, MAX_TOPIC_CHARS,
@@ -1245,5 +1245,135 @@ mod tests {
         );
         assert_eq!(store.gc_read().unwrap(), 1);
         assert_eq!(message_count(&store), 1);
+    }
+
+    // ── Широкомовна адреса: `Both` -> `*`, схема v2 ─────────────────────
+
+    /// Зробити базу **схеми v1** із заданими значеннями `to_agent`.
+    ///
+    /// Пишеться напряму, повз `Store`: саме так виглядає база, створена
+    /// попередньою збіркою, і лише на такій має сенс перевіряти міграцію.
+    fn v1_db(dir: &TempDir, to_agents: &[&str]) -> std::path::PathBuf {
+        let path = dir.path().join("v1.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0))
+            .unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        for (i, to) in to_agents.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO messages (ts_unix, v, from_agent, to_agent, topic, op, body, read_at)
+                 VALUES (?1, 1, 'Grok', ?2, 't', 'N', '{}', NULL)",
+                params![1000 + i as i64, to],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version = 1").unwrap();
+        path
+    }
+
+    fn to_agents_of(store: &Store) -> Vec<String> {
+        let conn = store.conn().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT to_agent FROM messages ORDER BY id")
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    fn insert_legacy_broadcast(store: &Store) -> i64 {
+        let conn = store.conn().unwrap();
+        conn.execute(
+            "INSERT INTO messages (ts_unix, v, from_agent, to_agent, topic, op, body, read_at)
+             VALUES (1000, 1, 'Grok', ?1, 't', 'N', '{}', NULL)",
+            params![BROADCAST_LEGACY],
+        )
+        .unwrap();
+        conn.query_row("SELECT max(id) FROM messages", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn migration_renames_broadcast_and_leaves_named_agents_alone() {
+        let dir = TempDir::new().unwrap();
+        let path = v1_db(&dir, &["Both", "Claude", "Both", "Grok"]);
+
+        let store = Store::open(&path).unwrap();
+
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            to_agents_of(&store),
+            vec!["*", "Claude", "*", "Grok"],
+            "міграція мала перейменувати ЛИШЕ широкомовні рядки"
+        );
+    }
+
+    /// ⚠️ Найдорожча гарантія цього зрізу: міграція нікого не загубила.
+    ///
+    /// `UPDATE` міг би зіпсувати адресацію тихо — рядки лишились би на місці,
+    /// а `inbox` перестав би їх віддавати. Тому перевіряється не вміст
+    /// колонки, а те, що адресат далі бачить своє.
+    #[test]
+    fn migrated_broadcast_is_still_delivered_to_everyone() {
+        let dir = TempDir::new().unwrap();
+        let path = v1_db(&dir, &["Both", "Claude"]);
+
+        let store = Store::open(&path).unwrap();
+
+        assert_eq!(
+            store.inbox(Agent::Grok, false).unwrap().len(),
+            1,
+            "Grok мав побачити широкомовне, яке до міграції було «Both»"
+        );
+        assert_eq!(
+            store.inbox(Agent::Claude, false).unwrap().len(),
+            2,
+            "Claude мав побачити і своє адресне, і широкомовне"
+        );
+    }
+
+    /// Рядок у старому написанні читається й після міграції.
+    ///
+    /// Це не гіпотетичний випадок: `ui` відкриває базу read-only й мігрувати
+    /// не вміє за побудовою, а копії для перевірок роблять із живої бази
+    /// будь-якої версії.
+    #[test]
+    fn legacy_spelling_is_still_delivered() {
+        let (_tmp, store) = tmp_store();
+        insert_legacy_broadcast(&store);
+        assert_eq!(
+            store.inbox(Agent::Claude, true).unwrap().len(),
+            1,
+            "старе написання широкомовної адреси мусить читатись назавжди"
+        );
+    }
+
+    #[test]
+    fn ack_reaches_broadcast_in_the_legacy_spelling() {
+        let (_tmp, store) = tmp_store();
+        let id = insert_legacy_broadcast(&store);
+
+        assert!(
+            store.ack_one(id, Agent::Claude).unwrap(),
+            "ack мав дістати широкомовне у старому написанні"
+        );
+        assert!(store.inbox(Agent::Claude, true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn broadcast_is_written_as_star_and_read_in_both_spellings() {
+        assert_eq!(Agent::Both.as_str(), BROADCAST);
+        assert_eq!(Agent::parse(BROADCAST).unwrap(), Agent::Both);
+        assert_eq!(Agent::parse(BROADCAST_LEGACY).unwrap(), Agent::Both);
+        assert!(
+            Agent::parse("Both!").is_err(),
+            "толерантність не мала розповзтися на схожі рядки"
+        );
+    }
+
+    /// Свіжа база одразу має цільову версію, а не проходить міграцію.
+    #[test]
+    fn a_new_database_starts_at_the_current_schema_version() {
+        let (_tmp, store) = tmp_store();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
     }
 }
