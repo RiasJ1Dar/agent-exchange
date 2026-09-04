@@ -29,15 +29,18 @@ pub const DEFAULT_NOW_MD: &str = r"C:\Users\Public\agent-board\NOW.md";
 /// перестає бути оглядом і починає бути дампом.
 pub const MESSAGE_LIMIT: usize = 50;
 
-/// Значення `to_agent`, яке означає «обом».
+/// Значення `to_agent`, яке означає «всім».
 ///
 /// ⚠️ Рядок, а не enum: у базі це TEXT, і саме так його порівнює
-/// `Store::inbox` (`to_agent = ?1 OR to_agent = 'Both'`).
+/// `Store::inbox` (`to_agent = ?1 OR to_agent IN ('*','Both')`).
 ///
 /// Визначення одне на крейт і живе в `page` — розряди непрочитаних
 /// відрізняються саме за цим рядком, і два його написання рано чи пізно
 /// розійшлися б.
-pub const BOTH: &str = crate::page::BOTH;
+pub const BROADCAST: &str = crate::page::BROADCAST;
+
+/// Історичне написання [`BROADCAST`] зі схеми v1 — див. `page`.
+pub const BROADCAST_LEGACY: &str = crate::page::BROADCAST_LEGACY;
 
 /// Агенти, для яких рахуються непрочитані.
 pub const GROK: &str = "Grok";
@@ -253,15 +256,19 @@ fn read_messages(conn: &Connection, path: &Path) -> Result<Vec<MessageView>, DbE
 
 /// Скільки непрочитаних лежить у скриньці агента.
 ///
-/// ⚠️ `Both` рахується **обом** — так само, як у `Store::inbox`
-/// (`to_agent = ?1 OR to_agent = 'Both'`). Інакше сторінка показувала б
+/// ⚠️ Широкомовне рахується **всім** — так само, як у `Store::inbox`
+/// (`to_agent = ?1 OR to_agent IN ('*','Both')`). Інакше сторінка показувала б
 /// нулі там, де насправді лежить неотримане.
+///
+/// Обидва написання перевіряються завжди: переглядач відкриває базу
+/// read-only і не мігрує її, тож схема v1 для нього — звичайний робочий
+/// випадок, а не залишок минулого.
 fn count_unread(conn: &Connection, path: &Path, agent: &str) -> Result<usize, DbError> {
     let n: i64 = conn
         .query_row(
             "SELECT count(*) FROM messages
-             WHERE (to_agent = ?1 OR to_agent = ?2) AND read_at IS NULL",
-            [agent, BOTH],
+             WHERE (to_agent = ?1 OR to_agent IN (?2, ?3)) AND read_at IS NULL",
+            [agent, BROADCAST, BROADCAST_LEGACY],
             |r| r.get(0),
         )
         .map_err(|e| classify(e, path, true))?;
@@ -564,9 +571,9 @@ mod tests {
             insert_msg(&w, 10, "Grok", "Claude", "t", "n", None);
             insert_msg(&w, 20, "Claude", "Grok", "t", "n", None);
             // ⚠️ Це має потрапити в обидва лічильники.
-            insert_msg(&w, 30, "Grok", BOTH, "t", "n", None);
+            insert_msg(&w, 30, "Grok", BROADCAST_LEGACY, "t", "n", None);
             // Прочитане не рахується жодному.
-            insert_msg(&w, 40, "Grok", BOTH, "t", "n", Some(41));
+            insert_msg(&w, 40, "Grok", BROADCAST_LEGACY, "t", "n", Some(41));
             insert_msg(&w, 50, "Claude", "Grok", "t", "n", Some(51));
         }
         let snap = read_snapshot(&db, 100, &dir.join("NOW.md")).expect("снапшот");
@@ -592,7 +599,7 @@ mod tests {
             // Три питання, зокрема одне широкомовне — воно теж питання.
             insert_msg(&w, 1, "Grok", "Claude", "t", "Q", None);
             insert_msg(&w, 2, "Claude", "Grok", "t", "Q", None);
-            insert_msg(&w, 3, "Grok", BOTH, "t", "Q", None);
+            insert_msg(&w, 3, "Grok", BROADCAST_LEGACY, "t", "Q", None);
             // Вісім адресних не-питань.
             for n in 0..8 {
                 let op = if n % 2 == 0 { "N" } else { "A" };
@@ -600,11 +607,11 @@ mod tests {
             }
             // Тридцять широкомовних статусів на Both.
             for n in 0..30 {
-                insert_msg(&w, 200 + n, "Grok", BOTH, "w2-ok", "N", None);
+                insert_msg(&w, 200 + n, "Grok", BROADCAST_LEGACY, "w2-ok", "N", None);
             }
             // Прочитане не рахується в жодному розряді.
             insert_msg(&w, 900, "Grok", "Claude", "t", "Q", Some(901));
-            insert_msg(&w, 902, "Grok", BOTH, "t", "N", Some(903));
+            insert_msg(&w, 902, "Grok", BROADCAST_LEGACY, "t", "N", Some(903));
         }
         let snap = read_snapshot(&db, 1_000, &dir.join("NOW.md")).expect("снапшот");
         assert_eq!(snap.unread_questions, 3);
@@ -630,7 +637,7 @@ mod tests {
             // Найстаріше — питання; у вибірку з 50 найновіших воно не влізе.
             insert_msg(&w, 1, "Grok", "Claude", "давнє", "Q", None);
             for n in 0..extra {
-                insert_msg(&w, 100 + n, "Grok", BOTH, "шум", "N", None);
+                insert_msg(&w, 100 + n, "Grok", BROADCAST_LEGACY, "шум", "N", None);
             }
         }
         let snap = read_snapshot(&db, 9_999, &dir.join("NOW.md")).expect("снапшот");
@@ -737,7 +744,7 @@ mod tests {
                 .expect("WAL");
             assert!(mode.eq_ignore_ascii_case("wal"), "режим={mode}");
             conn.execute_batch(SCHEMA).expect("схема");
-            insert_msg(&conn, 5, "Grok", BOTH, "t", "n", None);
+            insert_msg(&conn, 5, "Grok", BROADCAST_LEGACY, "t", "n", None);
         }
         // Писач закрився чисто — read-only читач мусить дати снапшот.
         let snap = read_snapshot(&db, 7, &dir.join("NOW.md")).expect("снапшот на WAL-базі");

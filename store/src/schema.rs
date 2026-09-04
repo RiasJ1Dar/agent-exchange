@@ -5,8 +5,12 @@ use std::path::Path;
 use std::sync::Mutex;
 
 /// Версія схеми БД, яку знає ця збірка. Пишеться в `PRAGMA user_version`.
-/// 1 = messages + locks + idx_messages_inbox (базова схема).
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// | версія | що з'явилось |
+/// |---|---|
+/// | 1 | `messages` + `locks` + `idx_messages_inbox` — базова схема |
+/// | 2 | широкомовна адреса `Both` перейменована на `*` |
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Один крок міграції: довести схему до версії `to`.
 ///
@@ -17,11 +21,32 @@ struct Migration {
     apply: fn(&Connection) -> Result<(), Error>,
 }
 
-/// Кроків поки немає: версія 1 — це базова схема, яку створює `CREATE TABLE
-/// IF NOT EXISTS` у [`Store::open`]. Наступні зрізи додають сюди рядки виду
-/// `Migration { to: 2, apply: |c| { c.execute_batch("ALTER TABLE …")?; Ok(()) } }`
+/// Версія 1 — базова схема, яку створює `CREATE TABLE IF NOT EXISTS` у
+/// [`Store::open`], тому окремого кроку `to: 1` немає.
+///
+/// Наступні зрізи дописують сюди рядки виду
+/// `Migration { to: 3, apply: |c| { c.execute_batch("ALTER TABLE …")?; Ok(()) } }`
 /// і піднімають [`SCHEMA_VERSION`].
-const MIGRATIONS: &[Migration] = &[];
+const MIGRATIONS: &[Migration] = &[Migration {
+    to: 2,
+    apply: |conn| {
+        // Широкомовна адреса перестала називатись числом учасників: сервер
+        // має бути придатним для чужої пари ШІ, а `Both` має сенс лише поки
+        // агентів рівно двоє.
+        //
+        // ⚠️ Зміст рядків не змінюється: у світі з двох агентів «усім» і
+        // «обом» — те саме. Тому це перейменування, а не втрата адресації.
+        //
+        // Незворотно. Читання приймає обидва написання назавжди
+        // (див. `messages::BROADCAST_LEGACY`), тож база, яку ніхто не
+        // мігрував, лишається робочою.
+        conn.execute(
+            "UPDATE messages SET to_agent = ?1 WHERE to_agent = ?2",
+            [crate::messages::BROADCAST, crate::messages::BROADCAST_LEGACY],
+        )?;
+        Ok(())
+    },
+}];
 
 fn read_user_version(conn: &Connection) -> Result<i64, Error> {
     Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)

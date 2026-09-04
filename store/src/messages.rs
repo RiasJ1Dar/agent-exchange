@@ -24,16 +24,32 @@ pub const GC_READ_TTL_SEC: i64 = 14 * 24 * 60 * 60;
 /// на одному [`crate::Store`]. Окремого MCP-інструмента немає.
 pub const GC_INTERVAL_SEC: i64 = 60 * 60;
 
+/// Адреса «всім», як вона лежить у базі.
+///
+/// ⚠️ Історично тут стояв рядок `Both` — назва, що мала сенс лише поки
+/// агентів рівно двоє. Сервер має бути придатним і для чужої пари ШІ, тож
+/// широкомовна адреса більше не називається числом учасників.
+///
+/// Символ `*` навмисно не може бути іменем агента: інакше агент із таким
+/// іменем читав би всю чужу пошту.
+pub const BROADCAST: &str = "*";
+
+/// Історичне написання [`BROADCAST`]. Приймається **на читанні назавжди**,
+/// а не лише під час міграції: `ui` відкриває базу read-only і мігрувати не
+/// може за побудовою, тож він завжди може побачити схему v1.
+pub const BROADCAST_LEGACY: &str = "Both";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Agent {
     Grok,
     Claude,
-    /// Дефолт свідомо `Both`, і це не «нейтральне значення заради `derive`».
+    /// Дефолт свідомо широкомовний, і це не «нейтральне значення заради
+    /// `derive`».
     ///
     /// `Default` тут потрібен лише [`InboxQuery`]. Якби дефолтом стояв
     /// конкретний агент, забутий `agent:` у запиті мовчки відкривав би чужу
-    /// скриньку. `Both` — найменш привілейований варіант: у скриньці `Both`
-    /// лежать самі розсилки, тобто те, що й так адресоване обом.
+    /// скриньку. Широкомовна адреса — найменш привілейований варіант: у ній
+    /// лежать самі розсилки, тобто те, що й так адресоване всім.
     #[default]
     Both,
 }
@@ -43,15 +59,20 @@ impl Agent {
         match self {
             Agent::Grok => "Grok",
             Agent::Claude => "Claude",
-            Agent::Both => "Both",
+            Agent::Both => BROADCAST,
         }
     }
 
+    /// Розбір імені з бази або з аргументів інструмента.
+    ///
+    /// Обидва написання широкомовної адреси приймаються назавжди: `*` — нове,
+    /// `Both` — те, що лежить у вже наявних базах і в чужих копіях, які ніхто
+    /// не мігрував.
     pub(crate) fn parse(s: &str) -> Result<Self, Error> {
         match s {
             "Grok" => Ok(Agent::Grok),
             "Claude" => Ok(Agent::Claude),
-            "Both" => Ok(Agent::Both),
+            BROADCAST | BROADCAST_LEGACY => Ok(Agent::Both),
             other => Err(Error::UnknownAgent(other.to_string())),
         }
     }
@@ -337,15 +358,19 @@ impl crate::Store {
         agent: Agent,
         unread_only: bool,
     ) -> Result<Vec<Message>, Error> {
+        // ⚠️ Широкомовна адреса перевіряється в ОБОХ написаннях, і це не
+        // тимчасовий місток на час міграції. База може бути на схемі v1 —
+        // чужа копія, копія для перевірки, або та, яку відкрив read-only
+        // процес, що мігрувати не вміє за побудовою.
         let sql = if unread_only {
             "SELECT id, ts_unix, v, from_agent, to_agent, topic, op, body, read_at
              FROM messages
-             WHERE (to_agent = ?1 OR to_agent = 'Both') AND read_at IS NULL
+             WHERE (to_agent = ?1 OR to_agent IN ('*','Both')) AND read_at IS NULL
              ORDER BY id ASC"
         } else {
             "SELECT id, ts_unix, v, from_agent, to_agent, topic, op, body, read_at
              FROM messages
-             WHERE (to_agent = ?1 OR to_agent = 'Both')
+             WHERE (to_agent = ?1 OR to_agent IN ('*','Both'))
              ORDER BY id ASC"
         };
         let mut stmt = conn.prepare(sql)?;
@@ -418,7 +443,7 @@ impl crate::Store {
         let n = conn.execute(
             "UPDATE messages SET read_at = ?1
              WHERE id = ?2
-               AND (to_agent = ?3 OR to_agent = 'Both')
+               AND (to_agent = ?3 OR to_agent IN ('*','Both'))
                AND read_at IS NULL",
             params![now_unix(), id, agent.as_str()],
         )?;
@@ -454,7 +479,7 @@ impl crate::Store {
             let mut stmt = tx.prepare(
                 "UPDATE messages SET read_at = ?1
                  WHERE id = ?2
-                   AND (to_agent = ?3 OR to_agent = 'Both')
+                   AND (to_agent = ?3 OR to_agent IN ('*','Both'))
                    AND read_at IS NULL",
             )?;
             for id in ids {
