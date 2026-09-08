@@ -8,7 +8,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
-use exchange_store::{Agent, Envelope, Lock};
+use exchange_store::{Agent, Envelope, Lock, Recipient};
 #[cfg(test)]
 use std::io::Write;
 
@@ -459,7 +459,7 @@ mod tests {
             .post(Envelope {
                 v: 1,
                 from: Agent::Claude,
-                to: Agent::Grok,
+                to: Recipient::One(Agent::Grok),
                 topic: "beta".into(),
                 op: exchange_store::Op::N,
                 body: json!({"n": "note"}),

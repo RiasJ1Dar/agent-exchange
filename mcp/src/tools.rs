@@ -1,5 +1,7 @@
 use crate::{Error, AGENT_NAME_ENV, DEFAULT_BRIEF_CHARS};
-use exchange_store::{Agent, Envelope, InboxQuery, Lock};
+use exchange_store::{
+    Agent, Envelope, InboxQuery, Lock, Recipient, BROADCAST, BROADCAST_LEGACY,
+};
 use serde_json::{json, Value};
 
 
@@ -34,7 +36,7 @@ impl crate::Mcp {
                 Ok(self.rendered(json!({ "id": id })))
             }
             "inbox" => {
-                let agent = json_field::<Agent>(args, "agent")?;
+                let agent = json_field::<Recipient>(args, "agent")?;
                 let unread_only = args
                     .get("unread_only")
                     .and_then(|v| v.as_bool())
@@ -122,20 +124,26 @@ impl crate::Mcp {
     ///   а не збій, тому у відповіді видно і `acked`, і `requested`.
     ///
     /// Особистість для `ack` — один ланцюг на обидва шляхи: явний `agent`
-    /// → `AGENT_NAME` → помилка. `Both` не приймається жодним із них.
+    /// → `AGENT_NAME` → помилка. Широкомовна адреса не приймається жодним.
     ///
     /// Спільна функція, а не два однакові шматки: розійшовшись, вони й дали б
     /// ту саму дірку, що була в `id` — один шлях питає, чиє це, другий ні.
     fn ack_agent(&self, args: &Value, agent_env: Option<&str>) -> Result<Agent, Error> {
-        let agent = resolve_agent(args, "agent", agent_env)?;
-        if matches!(agent, Agent::Both) {
-            return Err(Error::InvalidParams(
-                "agent=Both не підтверджує читання: Both — адреса розсилки, \
-                 а не особистість; передайте Grok або Claude"
-                    .into(),
-            ));
+        // ⚠️ Перевіряється СИРИЙ аргумент, до розбору в `Agent`.
+        //
+        // Тип більше не має широкомовного варіанта, тож `Agent::parse` сказав
+        // би просто «невідомий агент» — і людина шукала б друкарську помилку
+        // в імені замість справжньої причини. Повідомлення важливіше за
+        // економію рядка.
+        if let Some(raw) = args.get("agent").and_then(|v| v.as_str()) {
+            if raw == BROADCAST || raw == BROADCAST_LEGACY {
+                return Err(Error::InvalidParams(format!(
+                    "agent={raw} не підтверджує читання: це адреса розсилки, \
+                     а не особистість; передайте конкретного агента"
+                )));
+            }
         }
-        Ok(agent)
+        resolve_agent(args, "agent", agent_env)
     }
 
     fn ack_tool(&self, args: &Value, agent_env: Option<&str>) -> Result<Value, Error> {
