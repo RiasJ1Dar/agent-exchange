@@ -8,8 +8,8 @@ mod locks;
 pub use error::Error;
 pub use schema::{SCHEMA, SCHEMA_VERSION};
 pub use messages::{
-    Agent, Envelope, InboxQuery, Message, Op, BRIEF_MARK, BROADCAST, BROADCAST_LEGACY,
-    GC_INTERVAL_SEC, GC_READ_TTL_SEC, MAX_BODY_CHARS,
+    Agent, Envelope, InboxQuery, Message, Op, Recipient, BRIEF_MARK, BROADCAST,
+    BROADCAST_LEGACY, GC_INTERVAL_SEC, GC_READ_TTL_SEC, MAX_BODY_CHARS,
 };
 pub use locks::{
     normalize_topic, Evicted, Lock, LockOutcome, MAX_NOTE_CHARS, MAX_TOPIC_CHARS,
@@ -91,11 +91,16 @@ mod tests {
             .unwrap()
     }
 
-    fn env(from: Agent, to: Agent, op: Op, body: serde_json::Value) -> Envelope {
+    fn env(
+        from: Agent,
+        to: impl Into<Recipient>,
+        op: Op,
+        body: serde_json::Value,
+    ) -> Envelope {
         Envelope {
             v: 1,
             from,
-            to,
+            to: to.into(),
             topic: "xvid/core".into(),
             op,
             body,
@@ -128,7 +133,7 @@ mod tests {
         assert!(unread[0].read_at.is_none());
         assert_eq!(unread[0].envelope.v, 1);
         assert_eq!(unread[0].envelope.from, Agent::Grok);
-        assert_eq!(unread[0].envelope.to, Agent::Claude);
+        assert_eq!(unread[0].envelope.to, Recipient::One(Agent::Claude));
         assert_eq!(unread[0].envelope.topic, "xvid/core");
         assert_eq!(unread[0].envelope.op, Op::Q);
         assert_eq!(unread[0].envelope.body, json!({"q": "ping"}));
@@ -136,13 +141,13 @@ mod tests {
         assert!(store.inbox(Agent::Grok, true).unwrap().is_empty());
 
         let id_both = store
-            .post(env(Agent::Claude, Agent::Both, Op::N, json!({"n": "note"})))
+            .post(env(Agent::Claude, Recipient::All, Op::N, json!({"n": "note"})))
             .unwrap();
         let grok = store.inbox(Agent::Grok, true).unwrap();
         assert_eq!(grok.len(), 1);
         assert_eq!(grok[0].id, id_both);
         assert_eq!(store.inbox(Agent::Claude, true).unwrap().len(), 2);
-        assert_eq!(store.inbox(Agent::Both, true).unwrap().len(), 1);
+        assert_eq!(store.inbox(Recipient::All, true).unwrap().len(), 1);
 
         store.ack(id).unwrap();
         let unread = store.inbox(Agent::Claude, true).unwrap();
@@ -176,10 +181,11 @@ mod tests {
             other => panic!("очікував LockHeld, отримав {other:?}"),
         }
 
-        let err = store
-            .lock("other", Agent::Both, DEFAULT_TTL_SEC, "ні")
-            .unwrap_err();
-        assert!(matches!(err, Error::BothCannotLock));
+        // ⚠️ Тут стояв тест «замок «усіма» відхиляється». Він ЗНИК не тому,
+        // що правило скасували, а тому, що `lock` більше не приймає
+        // широкомовну адресу за типом: `Recipient::All` туди не передати.
+        // Правило лишилось живим у `locks_reject_broadcast_holder_from_db`,
+        // де перевіряється єдиний шлях, яким воно ще може прийти, — база.
 
         store
             .lock("xvid/core", Agent::Grok, DEFAULT_TTL_SEC, "оновлено")
@@ -190,7 +196,6 @@ mod tests {
         assert_eq!(locks[0].holder, Agent::Grok);
         assert_eq!(locks[0].ttl_sec, DEFAULT_TTL_SEC);
         assert_eq!(locks[0].note, "оновлено");
-        assert!(!matches!(locks[0].holder, Agent::Both));
 
         let err = store.unlock("xvid/core", Agent::Claude).unwrap_err();
         assert!(matches!(err, Error::LockNotHeld { .. }));
@@ -418,7 +423,7 @@ mod tests {
         assert_eq!(inbox.len(), 1, "у Grok має бути рівно одне сповіщення");
         assert_eq!(inbox[0].id, id);
         assert_eq!(inbox[0].envelope.from, Agent::Claude);
-        assert_eq!(inbox[0].envelope.to, Agent::Grok);
+        assert_eq!(inbox[0].envelope.to, Recipient::One(Agent::Grok));
         assert_eq!(inbox[0].envelope.topic, "xvid/core");
         assert_eq!(inbox[0].envelope.op, Op::N);
         assert_eq!(inbox[0].envelope.body["попередній_тримач"], "Grok");
@@ -579,16 +584,13 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::SelfMessage(Agent::Claude)), "{err:?}");
 
-        // Both→Both — теж буквальна рівність.
-        let err = store
-            .post(env(Agent::Both, Agent::Both, Op::N, json!({})))
-            .unwrap_err();
-        assert!(matches!(err, Error::SelfMessage(Agent::Both)), "{err:?}");
+        // ⚠️ Тут була пара «всі→всі». Її теж не написати: відправником
+        // тепер може бути лише конкретний агент.
 
         // А розсилка від конкретного агента — легальна (рішення №14),
         // навіть якщо він побачить її і в себе.
         let id = store
-            .post(env(Agent::Grok, Agent::Both, Op::N, json!({"n": "усім"})))
+            .post(env(Agent::Grok, Recipient::All, Op::N, json!({"n": "усім"})))
             .unwrap();
         assert!(id > 0);
         assert_eq!(store.inbox(Agent::Grok, true).unwrap().len(), 1);
@@ -597,11 +599,16 @@ mod tests {
 
     /// Те саме, що [`env`], але з довільною темою: фільтр `topic` треба
     /// перевіряти на різних написаннях, а не на одному «xvid/core».
-    fn env_topic(from: Agent, to: Agent, topic: &str, body: serde_json::Value) -> Envelope {
+    fn env_topic(
+        from: Agent,
+        to: impl Into<Recipient>,
+        topic: &str,
+        body: serde_json::Value,
+    ) -> Envelope {
         Envelope {
             v: 1,
             from,
-            to,
+            to: to.into(),
             topic: topic.into(),
             op: Op::N,
             body,
@@ -641,7 +648,7 @@ mod tests {
             .post(env(Agent::Grok, Agent::Claude, Op::Q, json!({"n": 1})))
             .unwrap();
         let b = store
-            .post(env(Agent::Grok, Agent::Both, Op::N, json!({"n": 2})))
+            .post(env(Agent::Grok, Recipient::All, Op::N, json!({"n": 2})))
             .unwrap();
         let c = store
             .post(env(Agent::Claude, Agent::Grok, Op::N, json!({"n": 3})))
@@ -685,7 +692,7 @@ mod tests {
 
         let got = store
             .inbox_ex(InboxQuery {
-                agent: Agent::Claude,
+                agent: Recipient::One(Agent::Claude),
                 limit: Some(2),
                 ..InboxQuery::default()
             })
@@ -699,7 +706,7 @@ mod tests {
         // Ліміт більший за наявне — усі п'ять, нічого не вигадано.
         let all = store
             .inbox_ex(InboxQuery {
-                agent: Agent::Claude,
+                agent: Recipient::One(Agent::Claude),
                 limit: Some(99),
                 ..InboxQuery::default()
             })
@@ -709,7 +716,7 @@ mod tests {
         // Нуль — це нуль, а не «усі».
         let none = store
             .inbox_ex(InboxQuery {
-                agent: Agent::Claude,
+                agent: Recipient::One(Agent::Claude),
                 limit: Some(0),
                 ..InboxQuery::default()
             })
@@ -732,7 +739,7 @@ mod tests {
 
         let cut = store
             .inbox_ex(InboxQuery {
-                agent: Agent::Claude,
+                agent: Recipient::One(Agent::Claude),
                 brief: Some(10),
                 ..InboxQuery::default()
             })
@@ -752,7 +759,7 @@ mod tests {
         // Тіло, що вміщується у стелю, позначки не отримує.
         let short = store
             .inbox_ex(InboxQuery {
-                agent: Agent::Claude,
+                agent: Recipient::One(Agent::Claude),
                 brief: Some(MAX_BODY_CHARS),
                 ..InboxQuery::default()
             })
@@ -770,7 +777,7 @@ mod tests {
             .unwrap();
         let cut = store
             .inbox_ex(InboxQuery {
-                agent: Agent::Claude,
+                agent: Recipient::One(Agent::Claude),
                 limit: Some(1),
                 brief: Some(5),
                 ..InboxQuery::default()
@@ -819,7 +826,7 @@ mod tests {
 
         let got = store
             .inbox_ex(InboxQuery {
-                agent: Agent::Claude,
+                agent: Recipient::One(Agent::Claude),
                 topic: Some("  xVid   CORE ".into()),
                 ..InboxQuery::default()
             })
@@ -830,7 +837,7 @@ mod tests {
 
         let slash = store
             .inbox_ex(InboxQuery {
-                agent: Agent::Claude,
+                agent: Recipient::One(Agent::Claude),
                 topic: Some("XVID/Core".into()),
                 ..InboxQuery::default()
             })
@@ -841,7 +848,7 @@ mod tests {
         // Теми, якої немає, — порожньо, а не «усе».
         let empty = store
             .inbox_ex(InboxQuery {
-                agent: Agent::Claude,
+                agent: Recipient::One(Agent::Claude),
                 topic: Some("нема такої".into()),
                 ..InboxQuery::default()
             })
@@ -855,7 +862,7 @@ mod tests {
     fn inbox_ex_exclude_own_is_opt_in() {
         let (_tmp, store) = tmp_store();
         let own = store
-            .post(env(Agent::Grok, Agent::Both, Op::N, json!({"n": "усім"})))
+            .post(env(Agent::Grok, Recipient::All, Op::N, json!({"n": "усім"})))
             .unwrap();
         let foreign = store
             .post(env(Agent::Claude, Agent::Grok, Op::N, json!({"n": "тобі"})))
@@ -863,7 +870,7 @@ mod tests {
 
         let default = store
             .inbox_ex(InboxQuery {
-                agent: Agent::Grok,
+                agent: Recipient::One(Agent::Grok),
                 ..InboxQuery::default()
             })
             .unwrap();
@@ -872,7 +879,7 @@ mod tests {
 
         let without_own = store
             .inbox_ex(InboxQuery {
-                agent: Agent::Grok,
+                agent: Recipient::One(Agent::Grok),
                 exclude_own: true,
                 ..InboxQuery::default()
             })
@@ -891,7 +898,7 @@ mod tests {
             .post(env(Agent::Grok, Agent::Claude, Op::Q, json!({"n": 1})))
             .unwrap();
         let both = store
-            .post(env(Agent::Grok, Agent::Both, Op::N, json!({"n": 2})))
+            .post(env(Agent::Grok, Recipient::All, Op::N, json!({"n": 2})))
             .unwrap();
         store
             .post(env(Agent::Claude, Agent::Grok, Op::A, json!({"n": 3})))
@@ -899,9 +906,13 @@ mod tests {
         store.ack_many(&[both], Agent::Claude).unwrap();
 
         // Дефолт запиту нікому не приписує чужої особи.
-        assert_eq!(Agent::default(), Agent::Both);
+        assert_eq!(Recipient::default(), Recipient::All);
 
-        for agent in [Agent::Grok, Agent::Claude, Agent::Both] {
+        for agent in [
+            Recipient::One(Agent::Grok),
+            Recipient::One(Agent::Claude),
+            Recipient::All,
+        ] {
             let old = store.inbox(agent, false).unwrap();
             let new = store
                 .inbox_ex(InboxQuery {
@@ -1111,7 +1122,7 @@ mod tests {
             .post(env(Agent::Claude, Agent::Grok, Op::A, json!({"a": 1})))
             .unwrap();
         let to_both = store
-            .post(env(Agent::Grok, Agent::Both, Op::N, json!({"n": 1})))
+            .post(env(Agent::Grok, Recipient::All, Op::N, json!({"n": 1})))
             .unwrap();
 
         // Чуже — false, без помилки, і чуже лишається непрочитаним.
@@ -1361,13 +1372,91 @@ mod tests {
 
     #[test]
     fn broadcast_is_written_as_star_and_read_in_both_spellings() {
-        assert_eq!(Agent::Both.as_str(), BROADCAST);
-        assert_eq!(Agent::parse(BROADCAST).unwrap(), Agent::Both);
-        assert_eq!(Agent::parse(BROADCAST_LEGACY).unwrap(), Agent::Both);
+        assert_eq!(Recipient::All.as_str(), BROADCAST);
+        assert_eq!(Recipient::parse(BROADCAST).unwrap(), Recipient::All);
+        assert_eq!(Recipient::parse(BROADCAST_LEGACY).unwrap(), Recipient::All);
         assert!(
-            Agent::parse("Both!").is_err(),
+            Recipient::parse("Both!").is_err(),
             "толерантність не мала розповзтися на схожі рядки"
         );
+    }
+
+    // ── Ролі: діяч і адреса — різні типи ────────────────────────────────
+
+    /// Єдиний шлях, яким широкомовний тримач ще може прийти, — база.
+    ///
+    /// ⚠️ Раніше це перевірялось на вході `lock()`. Тепер туди таке значення
+    /// не передати за типом, тож перевірка переїхала сюди — до читання чужих
+    /// даних, де вона й потрібна. Помилка навмисне `BothCannotLock`, а не
+    /// «невідомий агент»: у колонці лежить осмислене значення, просто
+    /// заборонене для цієї ролі, і людина має прочитати саме це.
+    #[test]
+    fn locks_reject_broadcast_holder_from_db() {
+        let (_tmp, store) = tmp_store();
+        {
+            let conn = store.conn().unwrap();
+            conn.execute(
+                "INSERT INTO locks (topic, holder, taken_at, ttl_sec, note)
+                 VALUES ('t', ?1, ?2, 7200, '')",
+                params![BROADCAST, now_unix()],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            store.locks().unwrap_err(),
+            Error::BothCannotLock
+        ));
+    }
+
+    /// Те саме для історичного написання: база могла лишитись на схемі v1.
+    #[test]
+    fn locks_reject_legacy_broadcast_holder_from_db() {
+        let (_tmp, store) = tmp_store();
+        {
+            let conn = store.conn().unwrap();
+            conn.execute(
+                "INSERT INTO locks (topic, holder, taken_at, ttl_sec, note)
+                 VALUES ('t', ?1, ?2, 7200, '')",
+                params![BROADCAST_LEGACY, now_unix()],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            store.locks().unwrap_err(),
+            Error::BothCannotLock
+        ));
+    }
+
+    /// Діяч і адреса розбираються різними правилами.
+    ///
+    /// Це і є суть зрізу: «всі» — законна адреса й незаконний діяч, і тепер
+    /// цю різницю видно вже в типах, а не лише в рантайм-перевірках.
+    #[test]
+    fn broadcast_is_an_address_but_never_an_actor() {
+        assert_eq!(Recipient::parse(BROADCAST).unwrap(), Recipient::All);
+        assert!(
+            Agent::parse(BROADCAST).is_err(),
+            "«всі» не може бути відправником чи тримачем замка"
+        );
+        assert!(Agent::parse(BROADCAST_LEGACY).is_err());
+    }
+
+    /// Адреса лягає в JSON простим рядком, а не структурою enum.
+    ///
+    /// ⚠️ `derive(Serialize)` для enum зі значенням дав би `{"One":"Grok"}` —
+    /// це мовчки зламало б `agent_talk.md`, який читають обидва агенти.
+    /// Тому serde для `Recipient` написаний вручну, і саме це тут закріплено.
+    #[test]
+    fn recipient_serialises_as_a_plain_string() {
+        let one = serde_json::to_string(&Recipient::One(Agent::Grok)).unwrap();
+        let all = serde_json::to_string(&Recipient::All).unwrap();
+        assert_eq!(one, "\"Grok\"");
+        assert_eq!(all, "\"*\"");
+
+        let back: Recipient = serde_json::from_str("\"*\"").unwrap();
+        assert_eq!(back, Recipient::All);
+        let back: Recipient = serde_json::from_str("\"Both\"").unwrap();
+        assert_eq!(back, Recipient::All, "старе написання читається з журналу");
     }
 
     /// Свіжа база одразу має цільову версію, а не проходить міграцію.

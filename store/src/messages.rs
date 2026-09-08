@@ -39,19 +39,20 @@ pub const BROADCAST: &str = "*";
 /// може за побудовою, тож він завжди може побачити схему v1.
 pub const BROADCAST_LEGACY: &str = "Both";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Конкретний агент — той, хто **діє**: пише, підтверджує, тримає замок.
+///
+/// ⚠️ Тут навмисно **немає** широкомовного варіанта, і це не спрощення.
+/// Раніше «всі» був третім значенням цього ж типу, тож підписати повідомлення
+/// від імені всіх або взяти замок «усіма» було синтаксично можливо — і від
+/// цього рятували чотири рантайм-перевірки `matches!(holder, Both)`,
+/// розкидані по `locks`. Тепер це гарантує тип: те, чого не можна зробити,
+/// не можна навіть написати.
+///
+/// Адреса, за якою повідомлення **отримують**, — окремий тип [`Recipient`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Agent {
     Grok,
     Claude,
-    /// Дефолт свідомо широкомовний, і це не «нейтральне значення заради
-    /// `derive`».
-    ///
-    /// `Default` тут потрібен лише [`InboxQuery`]. Якби дефолтом стояв
-    /// конкретний агент, забутий `agent:` у запиті мовчки відкривав би чужу
-    /// скриньку. Широкомовна адреса — найменш привілейований варіант: у ній
-    /// лежать самі розсилки, тобто те, що й так адресоване всім.
-    #[default]
-    Both,
 }
 
 impl Agent {
@@ -59,20 +60,17 @@ impl Agent {
         match self {
             Agent::Grok => "Grok",
             Agent::Claude => "Claude",
-            Agent::Both => BROADCAST,
         }
     }
 
-    /// Розбір імені з бази або з аргументів інструмента.
+    /// Розбір імені діяча з бази або з аргументів інструмента.
     ///
-    /// Обидва написання широкомовної адреси приймаються назавжди: `*` — нове,
-    /// `Both` — те, що лежить у вже наявних базах і в чужих копіях, які ніхто
-    /// не мігрував.
+    /// Широкомовні написання тут — **помилка**, а не значення: відправником
+    /// чи тримачем замка «всі» бути не можуть.
     pub(crate) fn parse(s: &str) -> Result<Self, Error> {
         match s {
             "Grok" => Ok(Agent::Grok),
             "Claude" => Ok(Agent::Claude),
-            BROADCAST | BROADCAST_LEGACY => Ok(Agent::Both),
             other => Err(Error::UnknownAgent(other.to_string())),
         }
     }
@@ -81,6 +79,77 @@ impl Agent {
 impl std::fmt::Display for Agent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// Кому адресовано: конкретному агентові або всім.
+///
+/// Окремий тип від [`Agent`], бо це інша роль. Адресатом може бути «всі»;
+/// відправником — ніколи.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Recipient {
+    /// Особисто цьому агентові.
+    One(Agent),
+    /// Усім. У базі лежить як [`BROADCAST`].
+    ///
+    /// Дефолт свідомо тут, і це не «нейтральне значення заради `derive`».
+    /// `Default` потрібен лише [`InboxQuery`]: якби дефолтом стояв конкретний
+    /// агент, забутий `agent:` у запиті мовчки відкривав би чужу скриньку.
+    /// «Всі» — найменш привілейований варіант: у цій скриньці лежать самі
+    /// розсилки, тобто те, що й так адресоване кожному.
+    #[default]
+    All,
+}
+
+impl Recipient {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Recipient::One(a) => a.as_str(),
+            Recipient::All => BROADCAST,
+        }
+    }
+
+    /// Розбір адреси з бази або з аргументів інструмента.
+    ///
+    /// Обидва написання широкомовної адреси приймаються назавжди: `*` — нове,
+    /// `Both` — те, що лежить у вже наявних базах і в чужих копіях, яких ніхто
+    /// не мігрував.
+    pub(crate) fn parse(s: &str) -> Result<Self, Error> {
+        match s {
+            BROADCAST | BROADCAST_LEGACY => Ok(Recipient::All),
+            other => Ok(Recipient::One(Agent::parse(other)?)),
+        }
+    }
+}
+
+impl std::fmt::Display for Recipient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// ⚠️ Serde вручну, і це не стилістика.
+///
+/// `derive` для enum зі значенням дав би `{"One":"Grok"}` замість `"Grok"` —
+/// тобто мовчки зламав би формат `agent_talk.md`, який читають обидва агенти,
+/// і зробив би несумісними всі вже записані рядки. Адреса має лишатись
+/// простим рядком, тим самим, що лежить у колонці `to_agent`.
+impl Serialize for Recipient {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Recipient {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        Recipient::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+impl From<Agent> for Recipient {
+    fn from(a: Agent) -> Self {
+        Recipient::One(a)
     }
 }
 
@@ -116,8 +185,10 @@ impl Op {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
     pub v: u32,
+    /// Хто пише. Завжди конкретний — «всі» відправником бути не можуть.
     pub from: Agent,
-    pub to: Agent,
+    /// Кому: особисто чи всім.
+    pub to: Recipient,
     pub topic: String,
     pub op: Op,
     /// Без секретів; значення cookies не логірувати.
@@ -150,8 +221,11 @@ pub const BRIEF_MARK: &str = "…";
 /// писати обрізані тіла в дошку людини, а дошка виглядала б повною.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InboxQuery {
-    /// Чия скринька: беруться повідомлення з `to == agent` або `to == Both`.
-    pub agent: Agent,
+    /// Чия скринька: беруться повідомлення з `to == agent` або широкомовні.
+    ///
+    /// [`Recipient::All`] означає «лише розсилки» — саме тому воно й дефолт:
+    /// найменше, що можна побачити, помилившись.
+    pub agent: Recipient,
     /// Тільки непрочитані.
     pub unread_only: bool,
     /// Скільки віддати — **найновіші**. `None` — усі.
@@ -164,8 +238,8 @@ pub struct InboxQuery {
     /// «xvid/core» і «xvid / core» лишаються різними.
     pub topic: Option<String>,
     /// Не показувати власні повідомлення агента (він бачить свої розсилки
-    /// `to = Both` у себе ж у скриньці). За замовчуванням `false` —
-    /// стара поведінка недоторкана.
+    /// у себе ж у скриньці). За замовчуванням `false` — стара поведінка
+    /// недоторкана.
     pub exclude_own: bool,
 }
 
@@ -217,9 +291,9 @@ pub(crate) fn post_with_conn(conn: &Connection, env: Envelope) -> Result<i64, Er
     if env.v != ENVELOPE_V {
         return Err(Error::BadVersion(env.v));
     }
-    // Заборонена лише **буквальна** рівність: from=Grok, to=Both — легальна
+    // Заборонена лише **буквальна** рівність: from=Grok, to=All — легальна
     // розсилка, хоч Grok і побачить її у власному inbox.
-    if env.from == env.to {
+    if Recipient::One(env.from) == env.to {
         return Err(Error::SelfMessage(env.from));
     }
     // Тема міряється нарівні з тілом: без цього стеля тіла обходилась
@@ -299,13 +373,20 @@ impl crate::Store {
         post_with_conn(&conn, env)
     }
 
-    /// Скринька агента: усе, що адресоване йому або `Both`, найстарші першими.
+    /// Скринька агента: усе, що адресоване йому або всім, найстарші першими.
     ///
     /// Делегат до [`Store::inbox_ex`] з дефолтним запитом — поведінка та сама,
     /// що й була. Для фільтрів беріть [`Store::inbox_ex`].
-    pub fn inbox(&self, agent: Agent, unread_only: bool) -> Result<Vec<Message>, Error> {
+    /// `impl Into<Recipient>` навмисне: `inbox(Agent::Claude, ..)` читається
+    /// краще за `inbox(Recipient::One(Agent::Claude), ..)`, а «лише розсилки»
+    /// лишається доступним через `Recipient::All`.
+    pub fn inbox(
+        &self,
+        agent: impl Into<Recipient>,
+        unread_only: bool,
+    ) -> Result<Vec<Message>, Error> {
         self.inbox_ex(InboxQuery {
-            agent,
+            agent: agent.into(),
             unread_only,
             ..InboxQuery::default()
         })
@@ -325,7 +406,9 @@ impl crate::Store {
         };
 
         if q.exclude_own {
-            out.retain(|m| m.envelope.from != q.agent);
+            // При `q.agent = All` не виключається ніхто: своєю скринька
+            // «лише розсилки» не буває.
+            out.retain(|m| Recipient::One(m.envelope.from) != q.agent);
         }
         if let Some(topic) = q.topic.as_deref() {
             let want = normalize_topic(topic);
@@ -355,7 +438,7 @@ impl crate::Store {
     /// який брав би гард удруге, завис би тихо.
     fn read_inbox(
         conn: &Connection,
-        agent: Agent,
+        agent: Recipient,
         unread_only: bool,
     ) -> Result<Vec<Message>, Error> {
         // ⚠️ Широкомовна адреса перевіряється в ОБОХ написаннях, і це не
@@ -396,7 +479,7 @@ impl crate::Store {
                 envelope: Envelope {
                     v,
                     from: Agent::parse(&from)?,
-                    to: Agent::parse(&to)?,
+                    to: Recipient::parse(&to)?,
                     topic,
                     op: Op::parse(&op)?,
                     body: serde_json::from_str(&body)?,
