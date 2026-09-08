@@ -1,5 +1,5 @@
 use crate::talk::TALK_NAME;
-use exchange_store::{Agent, Lock, Message, Op};
+use exchange_store::{Agent, Lock, Message, Op, Recipient};
 use std::borrow::Cow;
 use std::fmt::Write as FmtWrite;
 
@@ -95,20 +95,20 @@ fn tally_unread(msgs: &[Message]) -> Unread {
     for m in msgs.iter().filter(|m| m.read_at.is_none()) {
         let to = m.envelope.to;
         if m.envelope.op == Op::Q {
-            // Питання перебиває адресата: `Q` на `Both` — це питання
-            // обом, а не широкомовний статус.
-            if to == Agent::Grok || to == Agent::Both {
+            // Питання перебиває адресата: `Q` на всіх — це питання
+            // кожному, а не широкомовний статус.
+            if matches!(to, Recipient::One(Agent::Grok) | Recipient::All) {
                 t.q_grok += 1;
             }
-            if to == Agent::Claude || to == Agent::Both {
+            if matches!(to, Recipient::One(Agent::Claude) | Recipient::All) {
                 t.q_claude += 1;
             }
             continue;
         }
         match to {
-            Agent::Grok => t.personal_grok += 1,
-            Agent::Claude => t.personal_claude += 1,
-            Agent::Both => t.broadcast += 1,
+            Recipient::One(Agent::Grok) => t.personal_grok += 1,
+            Recipient::One(Agent::Claude) => t.personal_claude += 1,
+            Recipient::All => t.broadcast += 1,
         }
     }
     t

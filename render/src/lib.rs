@@ -1,4 +1,4 @@
-use exchange_store::{Agent, Store};
+use exchange_store::{Agent, Recipient, Store};
 use std::io::ErrorKind;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -104,8 +104,8 @@ fn render_locked(store: &Store, now_md: &Path) -> Result<(), Error> {
     // Повна вибірка: `agent_talk.md` — журнал, а лічильник
     // `ще M прочитаних` рахує ack-нуті. Стеля непрочитаних живе
     // уже в `build_inbox_block`, не в SQL.
-    let mut msgs = store.inbox(Agent::Grok, false)?;
-    let extra = store.inbox(Agent::Claude, false)?;
+    let mut msgs = store.inbox(Recipient::One(Agent::Grok), false)?;
+    let extra = store.inbox(Recipient::One(Agent::Claude), false)?;
     for m in extra {
         if !msgs.iter().any(|x| x.id == m.id) {
             msgs.push(m);
@@ -378,16 +378,21 @@ fn acquire_lock_with(now_md: &Path, wait: Duration, stale: Duration) -> Result<L
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exchange_store::{Agent, Envelope, Op, Store};
+    use exchange_store::{Agent, Envelope, Op, Recipient, Store};
     use std::fs;
     use std::time::SystemTime;
     use tempfile::tempdir;
 
-    fn sample_envelope(from: Agent, to: Agent, topic: &str, op: Op) -> Envelope {
+    fn sample_envelope(
+        from: Agent,
+        to: impl Into<Recipient>,
+        topic: &str,
+        op: Op,
+    ) -> Envelope {
         Envelope {
             v: 1,
             from,
-            to,
+            to: to.into(),
             topic: topic.to_string(),
             op,
             body: serde_json::json!({"k": "v"}),
@@ -1055,7 +1060,7 @@ mod tests {
             .post(sample_envelope(Agent::Grok, Agent::Claude, "beta", Op::A))
             .unwrap();
         let c = store
-            .post(sample_envelope(Agent::Grok, Agent::Both, "gamma", Op::N))
+            .post(sample_envelope(Agent::Grok, Recipient::All, "gamma", Op::N))
             .unwrap();
         store.ack(a).unwrap();
 
@@ -1082,7 +1087,11 @@ mod tests {
             "ack не врахований"
         );
         assert_eq!(rows[1]["read"], serde_json::json!(false));
-        assert_eq!(rows[2]["to"], "Both");
+        // ⚠️ Широкомовна адреса в журналі — простий рядок «*», а не
+        // `{"One":…}` чи `"All"`: `Recipient` серіалізується вручну саме
+        // заради цього. Було «Both»; журнал переписується цілком на кожному
+        // render, тож два написання в одному файлі не змішуються.
+        assert_eq!(rows[2]["to"], "*");
         assert_eq!(rows[2]["body"], serde_json::json!({"k": "v"}));
         assert!(rows[0]["ts"].as_i64().unwrap() > 0);
     }
@@ -1153,7 +1162,7 @@ mod tests {
             .post(sample_envelope(Agent::Claude, Agent::Grok, "beta", Op::N))
             .unwrap();
         let last = store
-            .post(sample_envelope(Agent::Grok, Agent::Both, "gamma", Op::A))
+            .post(sample_envelope(Agent::Grok, Recipient::All, "gamma", Op::A))
             .unwrap();
 
         render(&store, &now).unwrap();
@@ -1298,7 +1307,7 @@ mod tests {
             store
                 .post(sample_envelope(
                     Agent::Claude,
-                    Agent::Both,
+                    Recipient::All,
                     &format!("q{i}"),
                     Op::Q,
                 ))
@@ -1308,7 +1317,7 @@ mod tests {
             store
                 .post(sample_envelope(
                     Agent::Claude,
-                    Agent::Both,
+                    Recipient::All,
                     &format!("w{i}-ok"),
                     Op::N,
                 ))
@@ -1372,7 +1381,7 @@ mod tests {
         store
             .post(sample_envelope(
                 Agent::Grok,
-                Agent::Both,
+                Recipient::All,
                 "apk 15.74 MB",
                 Op::N,
             ))
@@ -1405,7 +1414,7 @@ mod tests {
             store
                 .post(sample_envelope(
                     Agent::Grok,
-                    Agent::Both,
+                    Recipient::All,
                     &format!("uniffi-ok {i}"),
                     Op::N,
                 ))

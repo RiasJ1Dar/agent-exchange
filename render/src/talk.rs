@@ -1,4 +1,4 @@
-use exchange_store::{Agent, Message, Op};
+use exchange_store::{Agent, Message, Op, Recipient};
 use serde::Serialize;
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
@@ -25,7 +25,7 @@ struct TalkLine<'a> {
     id: i64,
     ts: i64,
     from: Agent,
-    to: Agent,
+    to: Recipient,
     topic: &'a str,
     op: Op,
     read: bool,

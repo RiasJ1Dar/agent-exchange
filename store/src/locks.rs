@@ -1,5 +1,7 @@
 use crate::error::Error;
-use crate::messages::{post_with_conn, Agent, Envelope, Op, ENVELOPE_V};
+use crate::messages::{
+    post_with_conn, Agent, Envelope, Op, BROADCAST, BROADCAST_LEGACY, ENVELOPE_V,
+};
 use crate::now_unix;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -204,7 +206,7 @@ fn lock_inner(
                     Envelope {
                         v: ENVELOPE_V,
                         from: holder,
-                        to: ev.holder,
+                        to: ev.holder.into(),
                         topic: topic.to_string(),
                         op: Op::N,
                         body: eviction_body(topic, &ev, holder, now),
@@ -235,9 +237,6 @@ impl crate::Store {
     /// Сигнатура навмисне лишається `Result<(), Error>` — її кличе `mcp`.
     /// Кому саме віддали тему після протермінування, показує [`Store::lock_ex`].
     pub fn lock(&self, topic: &str, holder: Agent, ttl_sec: i64, note: &str) -> Result<(), Error> {
-        if matches!(holder, Agent::Both) {
-            return Err(Error::BothCannotLock);
-        }
         check_topic(topic)?;
         check_note(note)?;
         let topic = normalize_topic(topic);
@@ -266,9 +265,6 @@ impl crate::Store {
         ttl_sec: i64,
         note: &str,
     ) -> Result<LockOutcome, Error> {
-        if matches!(holder, Agent::Both) {
-            return Err(Error::BothCannotLock);
-        }
         check_topic(topic)?;
         check_note(note)?;
         let topic = normalize_topic(topic);
@@ -291,9 +287,6 @@ impl crate::Store {
     /// замок на тему незалежно від тримача — але це має бути свідома,
     /// написана руками дія, а не побічний ефект звичайного `unlock`.
     pub fn unlock_force(&self, topic: &str, holder: Agent, force: bool) -> Result<(), Error> {
-        if matches!(holder, Agent::Both) {
-            return Err(Error::BothCannotLock);
-        }
         check_topic(topic)?;
         let topic = normalize_topic(topic);
         let topic = topic.as_str();
@@ -334,10 +327,15 @@ impl crate::Store {
         let mut out = Vec::new();
         for row in rows {
             let (topic, holder, taken_at, ttl_sec, note) = row?;
-            let holder = Agent::parse(&holder)?;
-            if matches!(holder, Agent::Both) {
-                return Err(Error::BothCannotLock);
-            }
+            // ⚠️ Тут перевірка лишається, і це не дублювання типу.
+            // У колонці лежить довільний текст із бази: `Agent::parse`
+            // відхилить широкомовне написання сам, але помилка має бути
+            // саме «всі не тримають замків», а не «невідомий агент» —
+            // інакше людина шукала б друкарську помилку в імені.
+            let holder = match holder.as_str() {
+                BROADCAST | BROADCAST_LEGACY => return Err(Error::BothCannotLock),
+                other => Agent::parse(other)?,
+            };
             out.push(Lock {
                 topic,
                 holder,
