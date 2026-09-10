@@ -36,6 +36,19 @@ const TOOLS: &[&str] = &[
 /// Запасне джерело особистості, коли `from`/`holder` не передані явно.
 pub const AGENT_NAME_ENV: &str = "AGENT_NAME";
 
+/// Шлях до файла з приватним ключем підпису (64 hex-символи).
+///
+/// Не задано — сервер не підписує нічого й працює як до R5. Це не аварійний
+/// режим, а звичайний: підпис має сенс там, де є з ким його звіряти.
+pub const KEY_ENV: &str = "EXCHANGE_KEY";
+
+/// Ім'я, під яким підпис лягає в колонку `key_id`.
+///
+/// Не задано — береться `AGENT_NAME`, а якщо немає й його, то `default`.
+/// Окрема змінна потрібна, бо один агент може мати кілька ключів (змінив
+/// ключ — старі рядки лишились підписані старим, і за `key_id` видно, яким).
+pub const KEY_ID_ENV: &str = "EXCHANGE_KEY_ID";
+
 /// Скільки символів тіла віддавати, коли агент розгрібає чергу
 /// (`inbox` з `unread_only = true`) і сам стелі не назвав.
 ///
@@ -85,10 +98,30 @@ pub struct Mcp {
     now_md: PathBuf,
 }
 
+/// Прочитати ключ підпису зі змінних середовища.
+///
+/// ⚠️ Негодящий ключ — це **помилка старту**, а не тихий перехід до роботи
+/// без підпису. Людина, яка виставила `EXCHANGE_KEY`, розраховує, що
+/// повідомлення підписуються; мовчазний відкат означав би, що вона про це
+/// не дізнається, поки хтось не спробує перевірити підпис.
+fn key_from_env() -> Result<Option<exchange_store::Key>, Error> {
+    let Some(path) = std::env::var(KEY_ENV).ok().filter(|v| !v.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let id = std::env::var(KEY_ID_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| std::env::var(AGENT_NAME_ENV).ok())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    let key = exchange_store::Key::from_file(Path::new(path.trim()), id.trim())?;
+    Ok(Some(key))
+}
+
 impl Mcp {
     pub fn open(db: &Path, now_md: &Path) -> Result<Self, Error> {
         Ok(Self {
-            store: Store::open(db)?,
+            store: Store::open(db)?.with_key(key_from_env()?),
             now_md: now_md.to_path_buf(),
         })
     }
