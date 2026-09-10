@@ -5,9 +5,16 @@ use exchange_store::{
 use serde_json::{json, Value};
 
 
-/// Значення, які приймає [`AGENT_NAME_ENV`]. `Both` не є особистістю:
-/// це адреса розсилки, ним не підписуються і замків він не тримає.
-pub(crate) const ENV_AGENT_NAMES: &[&str] = &["Grok", "Claude"];
+/// Шаблон імені агента для JSON-схем інструментів — те, що бачить клієнт.
+///
+/// Мусить збігатися з правилами `Agent::new`; розійшовшись, вони дали б
+/// найгірше з двох світів: клієнт вважав би значення дозволеним, а сервер
+/// відхиляв би його вже після відправлення.
+const AGENT_PATTERN: &str = r"^[A-Za-z0-9_.-]{1,64}$";
+
+/// Те саме плюс широкомовна адреса. Окремий шаблон, бо `*` законний лише
+/// там, де вказують адресата.
+const RECIPIENT_PATTERN: &str = r"^(\*|[A-Za-z0-9_.-]{1,64})$";
 
 impl crate::Mcp {
     pub(crate) fn tools_call(&self, params: &Value) -> Value {
@@ -209,19 +216,20 @@ fn env_agent_name() -> Option<String> {
         .filter(|v| !v.trim().is_empty())
 }
 
-/// Розпізнати значення `AGENT_NAME` без урахування регістру.
+/// Розібрати значення `AGENT_NAME`.
+///
+/// ⚠️ **Регістр значущий**, і це зміна поведінки. Раніше тут стояло
+/// звіряння з переліком `Grok`/`Claude` без урахування регістру, тож
+/// `AGENT_NAME=claude` давало `Claude`. Тепер переліку немає — сервер не
+/// знає, як звуть агентів, — а отже, немає й канонічної форми, до якої
+/// можна було б привести: `Codex` і `codex` це просто різні імена.
+///
+/// Обрізаються лише пробіли з країв: вони майже завжди друкарська помилка
+/// в конфігу, а іменем бути не можуть за правилами [`Agent::new`].
 fn agent_from_env(raw: &str) -> Result<Agent, Error> {
-    let name = raw.trim();
-    for allowed in ENV_AGENT_NAMES {
-        if name.eq_ignore_ascii_case(allowed) {
-            return serde_json::from_value(json!(allowed))
-                .map_err(|e| Error::InvalidParams(e.to_string()));
-        }
-    }
-    Err(Error::InvalidParams(format!(
-        "{AGENT_NAME_ENV}=«{name}» не розпізнано; дозволені значення: {}",
-        ENV_AGENT_NAMES.join(", ")
-    )))
+    Agent::new(raw.trim()).map_err(|e| {
+        Error::InvalidParams(format!("{AGENT_NAME_ENV}=«{}»: {e}", raw.trim()))
+    })
 }
 
 /// Особистість для `from`/`holder`: явний аргумент виграє; якщо його немає —
@@ -234,8 +242,7 @@ fn resolve_agent(args: &Value, field: &str, agent_env: Option<&str>) -> Result<A
         Some(raw) => agent_from_env(raw),
         None => Err(Error::InvalidParams(format!(
             "немає {field}: передайте його явно або виставте змінну середовища \
-             {AGENT_NAME_ENV} ({})",
-            ENV_AGENT_NAMES.join(" або ")
+             {AGENT_NAME_ENV}",
         ))),
     }
 }
@@ -376,8 +383,8 @@ pub(crate) fn tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "from": { "type": "string", "enum": ["Grok", "Claude", "Both"] },
-                    "to": { "type": "string", "enum": ["Grok", "Claude", "Both"] },
+                    "from": { "type": "string", "pattern": AGENT_PATTERN },
+                    "to": { "type": "string", "pattern": RECIPIENT_PATTERN },
                     "topic": { "type": "string" },
                     "op": { "type": "string", "enum": ["Q", "A", "N", "L"] },
                     "body": { "type": "object" },
@@ -393,7 +400,7 @@ pub(crate) fn tool_defs() -> Value {
                 "type": "object",
                 "required": ["agent"],
                 "properties": {
-                    "agent": { "type": "string", "enum": ["Grok", "Claude", "Both"] },
+                    "agent": { "type": "string", "pattern": RECIPIENT_PATTERN },
                     "unread_only": { "type": "boolean" },
                     "limit": { "type": "integer", "minimum": 0 },
                     "brief": { "type": "integer", "minimum": 0 },
@@ -409,7 +416,7 @@ pub(crate) fn tool_defs() -> Value {
                 "properties": {
                     "id": { "type": "integer" },
                     "ids": { "type": "array", "items": { "type": "integer" } },
-                    "agent": { "type": "string", "enum": ["Grok", "Claude"] }
+                    "agent": { "type": "string", "pattern": AGENT_PATTERN }
                 }
             }
         },
@@ -421,7 +428,7 @@ pub(crate) fn tool_defs() -> Value {
                 "required": ["topic"],
                 "properties": {
                     "topic": { "type": "string" },
-                    "holder": { "type": "string", "enum": ["Grok", "Claude"] },
+                    "holder": { "type": "string", "pattern": AGENT_PATTERN },
                     "ttl_sec": { "type": "integer" },
                     "note": { "type": "string" }
                 }
@@ -435,7 +442,7 @@ pub(crate) fn tool_defs() -> Value {
                 "required": ["topic"],
                 "properties": {
                     "topic": { "type": "string" },
-                    "holder": { "type": "string", "enum": ["Grok", "Claude"] }
+                    "holder": { "type": "string", "pattern": AGENT_PATTERN }
                 }
             }
         },
