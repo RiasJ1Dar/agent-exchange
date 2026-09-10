@@ -72,6 +72,126 @@ fn push_field(out: &mut String, value: &str) {
 /// ототожнення тоді коштувало б дорого.
 pub const SIGNABLE_ENVELOPE_V: u32 = ENVELOPE_V;
 
+/// Довжина приватного ключа (seed) у байтах.
+pub const KEY_BYTES: usize = 32;
+/// Довжина підпису Ed25519 у байтах.
+pub const SIG_BYTES: usize = 64;
+
+/// Закодувати байти в hex.
+///
+/// ⚠️ Свій, а не крейт. Не з упертості: підпис і ключ треба покласти в
+/// текстову колонку, і це чи не єдиний випадок, коли власні десять рядків
+/// чесніші за залежність — тут немає ні криптографії, ні крайніх випадків,
+/// які варто комусь довіряти. Саму криптографію, навпаки, свою не пишемо.
+pub fn to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Розібрати hex назад у байти. Довжина перевіряється викликачем.
+pub fn from_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let raw = s.as_bytes();
+    for pair in raw.chunks(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
+}
+
+/// Ключ, яким підписують. Обгортка над `ed25519_dalek::SigningKey`.
+pub struct Key {
+    inner: ed25519_dalek::SigningKey,
+    /// Ім'я ключа для колонки `key_id` — щоб було видно, чим підписано,
+    /// не звіряючи криптографію.
+    pub id: String,
+}
+
+impl Key {
+    /// Зробити ключ із 32 байтів seed.
+    pub fn from_seed(seed: &[u8], id: &str) -> Result<Self, Error> {
+        if seed.len() != KEY_BYTES {
+            return Err(Error::BadKey(format!(
+                "ключ має бути {KEY_BYTES} байтів, отримано {}",
+                seed.len()
+            )));
+        }
+        let mut buf = [0u8; KEY_BYTES];
+        buf.copy_from_slice(seed);
+        Ok(Key {
+            inner: ed25519_dalek::SigningKey::from_bytes(&buf),
+            id: id.to_string(),
+        })
+    }
+
+    /// Прочитати ключ із файла: рівно 64 hex-символи, пробіли з країв можна.
+    ///
+    /// ⚠️ Прав доступу тут не перевіряємо, і це свідома межа: на Windows
+    /// ACL перевіряти складно й ненадійно, а половинчаста перевірка давала б
+    /// хибне відчуття захищеності. Тримати файл ключа осторонь — робота
+    /// того, хто його кладе; про це сказано в документації.
+    pub fn from_file(path: &std::path::Path, id: &str) -> Result<Self, Error> {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| Error::BadKey(format!("{}: {e}", path.display())))?;
+        let hex = raw.trim();
+        let seed = from_hex(hex).ok_or_else(|| {
+            Error::BadKey(format!(
+                "{}: очікував {} hex-символів, а там не hex",
+                path.display(),
+                KEY_BYTES * 2
+            ))
+        })?;
+        Key::from_seed(&seed, id)
+    }
+
+    /// Публічний ключ у hex — те, що кладуть у конфіг для перевірки.
+    pub fn public_hex(&self) -> String {
+        use ed25519_dalek::VerifyingKey;
+        let vk: VerifyingKey = self.inner.verifying_key();
+        to_hex(vk.as_bytes())
+    }
+
+    /// Підписати канонічний рядок. Повертає підпис у hex.
+    pub fn sign(&self, canonical: &str) -> String {
+        use ed25519_dalek::Signer;
+        to_hex(&self.inner.sign(canonical.as_bytes()).to_bytes())
+    }
+}
+
+/// Перевірити підпис публічним ключем.
+///
+/// Повертає `false` на будь-якій негодящості — хибний hex, не та довжина,
+/// не той підпис. Розрізняти їх назовні немає сенсу: усі три означають
+/// «цьому рядку вірити не можна».
+pub fn verify(public_hex: &str, canonical: &str, sig_hex: &str) -> bool {
+    use ed25519_dalek::{Signature, VerifyingKey};
+
+    let Some(pk) = from_hex(public_hex) else {
+        return false;
+    };
+    let Ok(pk): Result<[u8; KEY_BYTES], _> = pk.try_into() else {
+        return false;
+    };
+    let Ok(vk) = VerifyingKey::from_bytes(&pk) else {
+        return false;
+    };
+    let Some(sig) = from_hex(sig_hex) else {
+        return false;
+    };
+    let Ok(sig): Result<[u8; SIG_BYTES], _> = sig.try_into() else {
+        return false;
+    };
+    vk.verify_strict(canonical.as_bytes(), &Signature::from_bytes(&sig))
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +304,101 @@ mod tests {
         let s = canonical(&e, 1000).unwrap();
         // «їжа» — три символи, шість байтів UTF-8.
         assert!(s.contains("|6:їжа|"), "{s}");
+    }
+
+    // ── Підпис ──────────────────────────────────────────────────────────
+
+    fn key(id: &str, seed_byte: u8) -> Key {
+        Key::from_seed(&[seed_byte; KEY_BYTES], id).unwrap()
+    }
+
+    #[test]
+    fn a_signature_verifies_with_its_own_public_key() {
+        let k = key("claude-1", 7);
+        let msg = canonical(&env("t", json!({"n": 1})), 1000).unwrap();
+        let sig = k.sign(&msg);
+
+        assert!(verify(&k.public_hex(), &msg, &sig));
+    }
+
+    /// ⚠️ Суть усього R5: **чужим ключем підписатись не можна**.
+    ///
+    /// Саме це не закриває HMAC зі спільним секретом — там хто може
+    /// перевірити, той може й підробити. Тут здатності розведені.
+    #[test]
+    fn another_key_cannot_produce_a_signature_that_verifies() {
+        let mine = key("claude-1", 7);
+        let theirs = key("grok-1", 9);
+        let msg = canonical(&env("t", json!({})), 1000).unwrap();
+
+        let forged = theirs.sign(&msg);
+        assert!(
+            !verify(&mine.public_hex(), &msg, &forged),
+            "підпис чужим ключем зарахувався як мій"
+        );
+    }
+
+    #[test]
+    fn a_changed_message_breaks_the_signature() {
+        let k = key("claude-1", 7);
+        let msg = canonical(&env("t", json!({"n": 1})), 1000).unwrap();
+        let sig = k.sign(&msg);
+
+        let other = canonical(&env("t", json!({"n": 2})), 1000).unwrap();
+        assert!(!verify(&k.public_hex(), &other, &sig), "тіло");
+
+        let later = canonical(&env("t", json!({"n": 1})), 1001).unwrap();
+        assert!(!verify(&k.public_hex(), &later, &sig), "час");
+    }
+
+    /// Негодящий вхід — це «не вірити», а не паніка.
+    #[test]
+    fn garbage_input_is_rejected_quietly() {
+        let k = key("claude-1", 7);
+        let msg = canonical(&env("t", json!({})), 1000).unwrap();
+        let sig = k.sign(&msg);
+
+        assert!(!verify("не hex", &msg, &sig), "ключ не hex");
+        assert!(!verify(&k.public_hex(), &msg, "не hex"), "підпис не hex");
+        assert!(!verify("aabb", &msg, &sig), "ключ не тієї довжини");
+        assert!(!verify(&k.public_hex(), &msg, "aabb"), "підпис не тієї довжини");
+        assert!(!verify("", &msg, &sig), "порожній ключ");
+    }
+
+    #[test]
+    fn hex_round_trips() {
+        for bytes in [vec![], vec![0], vec![255, 0, 16], vec![7; KEY_BYTES]] {
+            let hex = to_hex(&bytes);
+            assert_eq!(from_hex(&hex).unwrap(), bytes, "{hex}");
+        }
+        assert_eq!(to_hex(&[0, 15, 16, 255]), "000f10ff");
+        assert!(from_hex("abc").is_none(), "непарна довжина");
+        assert!(from_hex("zz").is_none(), "не hex-цифри");
+    }
+
+    #[test]
+    fn a_key_file_is_read_and_checked() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("k.hex");
+
+        std::fs::write(&path, format!("  {}  
+", to_hex(&[3u8; KEY_BYTES]))).unwrap();
+        let k = Key::from_file(&path, "id").unwrap();
+        assert_eq!(k.id, "id");
+
+        std::fs::write(&path, "не hex").unwrap();
+        assert!(matches!(Key::from_file(&path, "id"), Err(Error::BadKey(_))));
+
+        std::fs::write(&path, to_hex(&[1u8; 8])).unwrap();
+        assert!(
+            matches!(Key::from_file(&path, "id"), Err(Error::BadKey(_))),
+            "коротка довжина мала бути помилкою"
+        );
+
+        assert!(matches!(
+            Key::from_file(&dir.path().join("немає"), "id"),
+            Err(Error::BadKey(_))
+        ));
     }
 
     #[test]
