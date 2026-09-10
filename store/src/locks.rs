@@ -1,6 +1,7 @@
 use crate::error::Error;
 use crate::messages::{
-    post_with_conn, Agent, Envelope, Op, BROADCAST, BROADCAST_LEGACY, ENVELOPE_V,
+    post_with_conn, Agent, Envelope, Op, Recipient, BROADCAST, BROADCAST_LEGACY,
+    ENVELOPE_V,
 };
 use crate::now_unix;
 use rusqlite::{params, Connection};
@@ -63,7 +64,7 @@ pub struct Lock {
 /// Повертається з [`Store::lock_ex`], щоб перехоплення було **видимим**:
 /// мовчазне видалення протермінованого рядка не лишало жодного сліду —
 /// ані в результаті виклику, ані в inbox колишнього тримача.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Evicted {
     /// Хто тримав замок до перехоплення.
     pub holder: Agent,
@@ -119,7 +120,7 @@ fn expire_locks(conn: &Connection, now: i64) -> Result<(), Error> {
 
 /// Тіло сповіщення про перехоплення. Свідомо коротке — воно має
 /// поміститись у [`MAX_BODY_CHARS`] за будь-якої довжини теми.
-fn eviction_body(topic: &str, evicted: &Evicted, new_holder: Agent, now: i64) -> serde_json::Value {
+fn eviction_body(topic: &str, evicted: &Evicted, new_holder: &Agent, now: i64) -> serde_json::Value {
     serde_json::json!({
         "подія": "замок перехоплено після протермінування",
         "тема": topic,
@@ -197,19 +198,22 @@ fn lock_inner(
 
     let mut notified_id = None;
     if notify {
-        if let Some(ev) = evicted {
+        if let Some(ev) = evicted.as_ref() {
             // Свій же протермінований замок — перехоплення формально є, але
             // писати самому собі не можна (і нема кого сповіщати).
             if ev.holder != holder {
+                // ⚠️ Тіло складається ПЕРШИМ: після переїзду `holder` і
+                // `ev.holder` у конверт їх уже не позичити.
+                let body = eviction_body(topic, ev, &holder, now);
                 notified_id = Some(post_with_conn(
                     conn,
                     Envelope {
                         v: ENVELOPE_V,
-                        from: holder,
-                        to: ev.holder.into(),
+                        from: holder.clone(),
+                        to: Recipient::One(ev.holder.clone()),
                         topic: topic.to_string(),
                         op: Op::N,
-                        body: eviction_body(topic, &ev, holder, now),
+                        body,
                     },
                 )?);
             }

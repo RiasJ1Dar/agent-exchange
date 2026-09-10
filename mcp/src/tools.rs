@@ -71,7 +71,7 @@ impl crate::Mcp {
                 // лишає слід: `evicted` у відповіді й сповіщення `Op::N`
                 // колишньому тримачеві. Тихий варіант мовчки забирав тему,
                 // і той, у кого її забрали, продовжував вважати її своєю.
-                let outcome = self.store.lock_ex(topic, holder, ttl_sec, note)?;
+                let outcome = self.store.lock_ex(topic, holder.clone(), ttl_sec, note)?;
                 Ok(self.rendered(json!({
                     "ok": true,
                     "topic": topic,
@@ -83,7 +83,7 @@ impl crate::Mcp {
             "unlock" => {
                 let topic = json_str(args, "topic")?;
                 let holder = resolve_agent(args, "holder", agent_env)?;
-                self.store.unlock(topic, holder)?;
+                self.store.unlock(topic, holder.clone())?;
                 Ok(self.rendered(json!({
                     "ok": true,
                     "topic": topic,
@@ -160,7 +160,7 @@ impl crate::Mcp {
             (true, false) => {
                 let id = json_i64(args, "id")?;
                 let agent = self.ack_agent(args, agent_env)?;
-                let acked = self.store.ack_one(id, agent)?;
+                let acked = self.store.ack_one(id, agent.clone())?;
                 Ok(self.rendered(json!({
                     "ok": true,
                     "id": id,
@@ -171,7 +171,7 @@ impl crate::Mcp {
             (false, true) => {
                 let ids = json_i64_array(args, "ids")?;
                 let agent = self.ack_agent(args, agent_env)?;
-                let acked = self.store.ack_many(&ids, agent)?;
+                let acked = self.store.ack_many(&ids, agent.clone())?;
                 Ok(self.rendered(json!({
                     "ok": true,
                     "agent": agent,

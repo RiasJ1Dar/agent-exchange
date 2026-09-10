@@ -227,6 +227,13 @@ pub fn run_stdio() -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    /// Ім'я агента для тесту. Паніка на негодящому — навмисно: у тестах
+    /// імена задані руками, і мовчазний `Result` тут лише ховав би друкарську
+    /// помилку в самому тесті.
+    fn ag(name: &str) -> Agent {
+        Agent::new(name).expect("ім'я агента в тесті має бути валідним")
+    }
+
     use super::*;
     use serde_json::json;
     use std::fs;
@@ -458,8 +465,8 @@ mod tests {
         mcp.store
             .post(Envelope {
                 v: 1,
-                from: Agent::Claude,
-                to: Recipient::One(Agent::Grok),
+                from: ag("Claude"),
+                to: Recipient::One(ag("Grok")),
                 topic: "beta".into(),
                 op: exchange_store::Op::N,
                 body: json!({"n": "note"}),
@@ -823,14 +830,14 @@ mod tests {
         let locks = vec![
             Lock {
                 topic: "xvid/core".to_string(),
-                holder: Agent::Grok,
+                holder: ag("Grok"),
                 taken_at: now - 30,
                 ttl_sec: 300,
                 note: "живий".to_string(),
             },
             Lock {
                 topic: "xvid/ui".to_string(),
-                holder: Agent::Claude,
+                holder: ag("Claude"),
                 taken_at: now - 600,
                 ttl_sec: 60,
                 note: "прострочений".to_string(),
@@ -860,7 +867,7 @@ mod tests {
         let now = 1_700_000_000;
         let locks = vec![Lock {
             topic: "t".to_string(),
-            holder: Agent::Grok,
+            holder: ag("Grok"),
             taken_at: now - 60,
             ttl_sec: 60,
             note: String::new(),

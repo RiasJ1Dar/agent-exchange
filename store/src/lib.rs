@@ -9,7 +9,8 @@ pub use error::Error;
 pub use schema::{SCHEMA, SCHEMA_VERSION};
 pub use messages::{
     Agent, Envelope, InboxQuery, Message, Op, Recipient, BRIEF_MARK, BROADCAST,
-    BROADCAST_LEGACY, GC_INTERVAL_SEC, GC_READ_TTL_SEC, MAX_BODY_CHARS,
+    BROADCAST_LEGACY, GC_INTERVAL_SEC, GC_READ_TTL_SEC, MAX_AGENT_CHARS,
+    MAX_BODY_CHARS,
 };
 pub use locks::{
     normalize_topic, Evicted, Lock, LockOutcome, MAX_NOTE_CHARS, MAX_TOPIC_CHARS,
@@ -51,6 +52,13 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    /// Ім'я агента для тесту. Паніка на негодящому — навмисно: у тестах
+    /// імена задані руками, і мовчазний `Result` тут лише ховав би друкарську
+    /// помилку в самому тесті.
+    fn ag(name: &str) -> Agent {
+        Agent::new(name).expect("ім'я агента в тесті має бути валідним")
+    }
 
     fn tmp_store() -> (TempDir, Store) {
         let dir = TempDir::new().unwrap();
@@ -123,38 +131,38 @@ mod tests {
     fn post_inbox_ack() {
         let (_tmp, store) = tmp_store();
         let id = store
-            .post(env(Agent::Grok, Agent::Claude, Op::Q, json!({"q": "ping"})))
+            .post(env(ag("Grok"), ag("Claude"), Op::Q, json!({"q": "ping"})))
             .unwrap();
         assert!(id > 0);
 
-        let unread = store.inbox(Agent::Claude, true).unwrap();
+        let unread = store.inbox(ag("Claude"), true).unwrap();
         assert_eq!(unread.len(), 1);
         assert_eq!(unread[0].id, id);
         assert!(unread[0].read_at.is_none());
         assert_eq!(unread[0].envelope.v, 1);
-        assert_eq!(unread[0].envelope.from, Agent::Grok);
-        assert_eq!(unread[0].envelope.to, Recipient::One(Agent::Claude));
+        assert_eq!(unread[0].envelope.from, ag("Grok"));
+        assert_eq!(unread[0].envelope.to, Recipient::One(ag("Claude")));
         assert_eq!(unread[0].envelope.topic, "xvid/core");
         assert_eq!(unread[0].envelope.op, Op::Q);
         assert_eq!(unread[0].envelope.body, json!({"q": "ping"}));
 
-        assert!(store.inbox(Agent::Grok, true).unwrap().is_empty());
+        assert!(store.inbox(ag("Grok"), true).unwrap().is_empty());
 
         let id_both = store
-            .post(env(Agent::Claude, Recipient::All, Op::N, json!({"n": "note"})))
+            .post(env(ag("Claude"), Recipient::All, Op::N, json!({"n": "note"})))
             .unwrap();
-        let grok = store.inbox(Agent::Grok, true).unwrap();
+        let grok = store.inbox(ag("Grok"), true).unwrap();
         assert_eq!(grok.len(), 1);
         assert_eq!(grok[0].id, id_both);
-        assert_eq!(store.inbox(Agent::Claude, true).unwrap().len(), 2);
+        assert_eq!(store.inbox(ag("Claude"), true).unwrap().len(), 2);
         assert_eq!(store.inbox(Recipient::All, true).unwrap().len(), 1);
 
         store.ack(id).unwrap();
-        let unread = store.inbox(Agent::Claude, true).unwrap();
+        let unread = store.inbox(ag("Claude"), true).unwrap();
         assert_eq!(unread.len(), 1);
         assert_eq!(unread[0].id, id_both);
 
-        let all = store.inbox(Agent::Claude, false).unwrap();
+        let all = store.inbox(ag("Claude"), false).unwrap();
         assert_eq!(all.len(), 2);
         assert!(all[0].read_at.is_some());
         assert!(all[1].read_at.is_none());
@@ -167,16 +175,16 @@ mod tests {
     fn foreign_lock() {
         let (_tmp, store) = tmp_store();
         store
-            .lock("xvid/core", Agent::Grok, DEFAULT_TTL_SEC, "працюю")
+            .lock("xvid/core", ag("Grok"), DEFAULT_TTL_SEC, "працюю")
             .unwrap();
 
         let err = store
-            .lock("xvid/core", Agent::Claude, DEFAULT_TTL_SEC, "теж")
+            .lock("xvid/core", ag("Claude"), DEFAULT_TTL_SEC, "теж")
             .unwrap_err();
         match err {
             Error::LockHeld { topic, holder } => {
                 assert_eq!(topic, "xvid/core");
-                assert_eq!(holder, Agent::Grok);
+                assert_eq!(holder, ag("Grok"));
             }
             other => panic!("очікував LockHeld, отримав {other:?}"),
         }
@@ -188,19 +196,19 @@ mod tests {
         // де перевіряється єдиний шлях, яким воно ще може прийти, — база.
 
         store
-            .lock("xvid/core", Agent::Grok, DEFAULT_TTL_SEC, "оновлено")
+            .lock("xvid/core", ag("Grok"), DEFAULT_TTL_SEC, "оновлено")
             .unwrap();
         let locks = store.locks().unwrap();
         assert_eq!(locks.len(), 1);
         assert_eq!(locks[0].topic, "xvid/core");
-        assert_eq!(locks[0].holder, Agent::Grok);
+        assert_eq!(locks[0].holder, ag("Grok"));
         assert_eq!(locks[0].ttl_sec, DEFAULT_TTL_SEC);
         assert_eq!(locks[0].note, "оновлено");
 
-        let err = store.unlock("xvid/core", Agent::Claude).unwrap_err();
+        let err = store.unlock("xvid/core", ag("Claude")).unwrap_err();
         assert!(matches!(err, Error::LockNotHeld { .. }));
 
-        store.unlock("xvid/core", Agent::Grok).unwrap();
+        store.unlock("xvid/core", ag("Grok")).unwrap();
         assert!(store.locks().unwrap().is_empty());
     }
 
@@ -213,7 +221,7 @@ mod tests {
     fn lock_ttl_expires() {
         let (_tmp, store) = tmp_store();
 
-        store.lock("xvid/core", Agent::Grok, 1, "короткий").unwrap();
+        store.lock("xvid/core", ag("Grok"), 1, "короткий").unwrap();
         let locks = store.locks().unwrap();
         assert_eq!(locks.len(), 1, "замок мав з'явитись");
         assert_eq!(locks[0].ttl_sec, MIN_TTL_SEC, "ttl=1 мав затиснутись до 60");
@@ -227,14 +235,14 @@ mod tests {
         assert!(store.locks().unwrap().is_empty(), "замок не протермінувався");
 
         // Протермінований чужий замок не блокує нового власника.
-        store.lock("xvid/core", Agent::Grok, 1, "знову").unwrap();
+        store.lock("xvid/core", ag("Grok"), 1, "знову").unwrap();
         age_lock(&store, "xvid/core", MIN_TTL_SEC + 1);
         store
-            .lock("xvid/core", Agent::Claude, DEFAULT_TTL_SEC, "мій")
+            .lock("xvid/core", ag("Claude"), DEFAULT_TTL_SEC, "мій")
             .unwrap();
         let locks = store.locks().unwrap();
         assert_eq!(locks.len(), 1);
-        assert_eq!(locks[0].holder, Agent::Claude);
+        assert_eq!(locks[0].holder, ag("Claude"));
         assert_eq!(locks[0].note, "мій");
         assert_eq!(locks[0].ttl_sec, DEFAULT_TTL_SEC);
     }
@@ -259,7 +267,7 @@ mod tests {
         let second = Store::open(&path).unwrap();
         assert_eq!(second.schema_version().unwrap(), SCHEMA_VERSION);
 
-        first.lock("alpha", Agent::Grok, 90, "hold").unwrap();
+        first.lock("alpha", ag("Grok"), 90, "hold").unwrap();
         assert_eq!(second.locks().unwrap().len(), 1);
     }
 
@@ -317,7 +325,7 @@ mod tests {
     fn lock_matches_regardless_of_case_and_spaces() {
         let (_tmp, store) = tmp_store();
         store
-            .lock("  XVid / Core  ", Agent::Grok, DEFAULT_TTL_SEC, "працюю")
+            .lock("  XVid / Core  ", ag("Grok"), DEFAULT_TTL_SEC, "працюю")
             .unwrap();
 
         let locks = store.locks().unwrap();
@@ -326,26 +334,26 @@ mod tests {
 
         // Той самий замок очима іншого агента — конфлікт, а не другий рядок.
         let err = store
-            .lock("xvid / core", Agent::Claude, DEFAULT_TTL_SEC, "теж")
+            .lock("xvid / core", ag("Claude"), DEFAULT_TTL_SEC, "теж")
             .unwrap_err();
         match err {
             Error::LockHeld { topic, holder } => {
                 assert_eq!(topic, "xvid / core");
-                assert_eq!(holder, Agent::Grok);
+                assert_eq!(holder, ag("Grok"));
             }
             other => panic!("очікував LockHeld, отримав {other:?}"),
         }
 
         // Той самий власник у третьому написанні — продовження, не другий рядок.
         store
-            .lock("XVID  /  CORE", Agent::Grok, DEFAULT_TTL_SEC, "оновив")
+            .lock("XVID  /  CORE", ag("Grok"), DEFAULT_TTL_SEC, "оновив")
             .unwrap();
         let locks = store.locks().unwrap();
         assert_eq!(locks.len(), 1);
         assert_eq!(locks[0].note, "оновив");
 
         // Знімається теж у будь-якому написанні.
-        store.unlock("  Xvid /   Core ", Agent::Grok).unwrap();
+        store.unlock("  Xvid /   Core ", ag("Grok")).unwrap();
         assert!(store.locks().unwrap().is_empty());
     }
 
@@ -353,25 +361,25 @@ mod tests {
     fn ttl_is_clamped() {
         let (_tmp, store) = tmp_store();
 
-        store.lock("t", Agent::Grok, 1, "нижче межі").unwrap();
+        store.lock("t", ag("Grok"), 1, "нижче межі").unwrap();
         assert_eq!(store.locks().unwrap()[0].ttl_sec, 60);
 
-        store.lock("t", Agent::Grok, 999_999, "вище межі").unwrap();
+        store.lock("t", ag("Grok"), 999_999, "вище межі").unwrap();
         assert_eq!(store.locks().unwrap()[0].ttl_sec, 86_400);
 
-        store.lock("t", Agent::Grok, MIN_TTL_SEC, "рівно нижня").unwrap();
+        store.lock("t", ag("Grok"), MIN_TTL_SEC, "рівно нижня").unwrap();
         assert_eq!(store.locks().unwrap()[0].ttl_sec, MIN_TTL_SEC);
 
-        store.lock("t", Agent::Grok, MAX_TTL_SEC, "рівно верхня").unwrap();
+        store.lock("t", ag("Grok"), MAX_TTL_SEC, "рівно верхня").unwrap();
         assert_eq!(store.locks().unwrap()[0].ttl_sec, MAX_TTL_SEC);
 
-        store.lock("t", Agent::Grok, 3600, "усередині").unwrap();
+        store.lock("t", ag("Grok"), 3600, "усередині").unwrap();
         assert_eq!(store.locks().unwrap()[0].ttl_sec, 3600);
 
         // 0 і від'ємне — «за замовчуванням», поведінка не змінилась.
-        store.lock("t", Agent::Grok, 0, "нуль").unwrap();
+        store.lock("t", ag("Grok"), 0, "нуль").unwrap();
         assert_eq!(store.locks().unwrap()[0].ttl_sec, DEFAULT_TTL_SEC);
-        store.lock("t", Agent::Grok, -5, "мінус").unwrap();
+        store.lock("t", ag("Grok"), -5, "мінус").unwrap();
         assert_eq!(store.locks().unwrap()[0].ttl_sec, DEFAULT_TTL_SEC);
     }
 
@@ -394,17 +402,17 @@ mod tests {
     fn expired_lock_is_evicted_loudly() {
         let (_tmp, store) = tmp_store();
         store
-            .lock("xvid/core", Agent::Grok, MIN_TTL_SEC, "працюю")
+            .lock("xvid/core", ag("Grok"), MIN_TTL_SEC, "працюю")
             .unwrap();
         let taken_at = store.locks().unwrap()[0].taken_at;
         age_lock(&store, "xvid/core", MIN_TTL_SEC + 1);
 
         let outcome = store
-            .lock_ex("xvid/core", Agent::Claude, DEFAULT_TTL_SEC, "мій")
+            .lock_ex("xvid/core", ag("Claude"), DEFAULT_TTL_SEC, "мій")
             .unwrap();
 
         let evicted = outcome.evicted.expect("евікшн мав бути видимим");
-        assert_eq!(evicted.holder, Agent::Grok);
+        assert_eq!(evicted.holder, ag("Grok"));
         assert_eq!(
             evicted.taken_at,
             taken_at - (MIN_TTL_SEC + 1),
@@ -414,16 +422,16 @@ mod tests {
         // Тема справді перейшла.
         let locks = store.locks().unwrap();
         assert_eq!(locks.len(), 1);
-        assert_eq!(locks[0].holder, Agent::Claude);
+        assert_eq!(locks[0].holder, ag("Claude"));
         assert_eq!(locks[0].note, "мій");
 
         // І колишній тримач про це дізнався — саме в inbox, а не «десь у логах».
         let id = outcome.notified_id.expect("сповіщення не надіслано");
-        let inbox = store.inbox(Agent::Grok, true).unwrap();
+        let inbox = store.inbox(ag("Grok"), true).unwrap();
         assert_eq!(inbox.len(), 1, "у Grok має бути рівно одне сповіщення");
         assert_eq!(inbox[0].id, id);
-        assert_eq!(inbox[0].envelope.from, Agent::Claude);
-        assert_eq!(inbox[0].envelope.to, Recipient::One(Agent::Grok));
+        assert_eq!(inbox[0].envelope.from, ag("Claude"));
+        assert_eq!(inbox[0].envelope.to, Recipient::One(ag("Grok")));
         assert_eq!(inbox[0].envelope.topic, "xvid/core");
         assert_eq!(inbox[0].envelope.op, Op::N);
         assert_eq!(inbox[0].envelope.body["попередній_тримач"], "Grok");
@@ -436,38 +444,38 @@ mod tests {
     fn live_foreign_lock_is_not_taken_by_lock_ex() {
         let (_tmp, store) = tmp_store();
         store
-            .lock("xvid/core", Agent::Grok, DEFAULT_TTL_SEC, "працюю")
+            .lock("xvid/core", ag("Grok"), DEFAULT_TTL_SEC, "працюю")
             .unwrap();
 
         let err = store
-            .lock_ex("xvid/core", Agent::Claude, DEFAULT_TTL_SEC, "теж")
+            .lock_ex("xvid/core", ag("Claude"), DEFAULT_TTL_SEC, "теж")
             .unwrap_err();
         match err {
             Error::LockHeld { topic, holder } => {
                 assert_eq!(topic, "xvid/core");
-                assert_eq!(holder, Agent::Grok);
+                assert_eq!(holder, ag("Grok"));
             }
             other => panic!("очікував LockHeld, отримав {other:?}"),
         }
 
         let locks = store.locks().unwrap();
-        assert_eq!(locks[0].holder, Agent::Grok, "замок віддали живим");
+        assert_eq!(locks[0].holder, ag("Grok"), "замок віддали живим");
         assert_eq!(locks[0].note, "працюю");
         assert!(
-            store.inbox(Agent::Grok, true).unwrap().is_empty(),
+            store.inbox(ag("Grok"), true).unwrap().is_empty(),
             "відмова не сміє нікого сповіщати"
         );
 
         // Вільна тема — теж без евікшна.
         let outcome = store
-            .lock_ex("інша тема", Agent::Claude, DEFAULT_TTL_SEC, "нова")
+            .lock_ex("інша тема", ag("Claude"), DEFAULT_TTL_SEC, "нова")
             .unwrap();
         assert_eq!(outcome.evicted, None);
         assert_eq!(outcome.notified_id, None);
 
         // Продовження власного живого замка — теж не евікшн.
         let outcome = store
-            .lock_ex("xvid/core", Agent::Grok, DEFAULT_TTL_SEC, "далі")
+            .lock_ex("xvid/core", ag("Grok"), DEFAULT_TTL_SEC, "далі")
             .unwrap();
         assert_eq!(outcome.evicted, None);
         assert_eq!(outcome.notified_id, None);
@@ -486,7 +494,7 @@ mod tests {
         let path = dir.path().join("exchange.db");
         let store = Store::open(&path).unwrap();
         store
-            .lock("xvid/core", Agent::Grok, MIN_TTL_SEC, "старий")
+            .lock("xvid/core", ag("Grok"), MIN_TTL_SEC, "старий")
             .unwrap();
         age_lock(&store, "xvid/core", MIN_TTL_SEC + 1);
 
@@ -495,7 +503,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let notified = worker
-                .lock_ex("xvid/core", Agent::Claude, DEFAULT_TTL_SEC, "мій")
+                .lock_ex("xvid/core", ag("Claude"), DEFAULT_TTL_SEC, "мій")
                 .map(|o| o.notified_id);
             let _ = tx.send(notified);
         });
@@ -512,32 +520,32 @@ mod tests {
     fn foreign_unlock_needs_force() {
         let (_tmp, store) = tmp_store();
         store
-            .lock("xvid/core", Agent::Grok, DEFAULT_TTL_SEC, "працюю")
+            .lock("xvid/core", ag("Grok"), DEFAULT_TTL_SEC, "працюю")
             .unwrap();
 
         let err = store
-            .unlock_force("xvid/core", Agent::Claude, false)
+            .unlock_force("xvid/core", ag("Claude"), false)
             .unwrap_err();
         assert!(matches!(err, Error::LockNotHeld { .. }));
         assert_eq!(store.locks().unwrap().len(), 1, "замок зняли без force");
 
         store
-            .unlock_force("xvid/core", Agent::Claude, true)
+            .unlock_force("xvid/core", ag("Claude"), true)
             .unwrap();
         assert!(store.locks().unwrap().is_empty(), "force не зняв замок");
 
         // Немає замка взагалі — force не вигадує успіх.
         let err = store
-            .unlock_force("xvid/core", Agent::Claude, true)
+            .unlock_force("xvid/core", ag("Claude"), true)
             .unwrap_err();
         assert!(matches!(err, Error::LockNotHeld { .. }));
 
         // Власний замок знімається і без force — стара поведінка ціла.
         store
-            .lock("xvid/core", Agent::Claude, DEFAULT_TTL_SEC, "мій")
+            .lock("xvid/core", ag("Claude"), DEFAULT_TTL_SEC, "мій")
             .unwrap();
         store
-            .unlock_force("xvid/core", Agent::Claude, false)
+            .unlock_force("xvid/core", ag("Claude"), false)
             .unwrap();
         assert!(store.locks().unwrap().is_empty());
     }
@@ -549,13 +557,13 @@ mod tests {
 
         let ok = body_of_len(MAX_BODY_CHARS);
         let id = store
-            .post(env(Agent::Grok, Agent::Claude, Op::N, ok))
+            .post(env(ag("Grok"), ag("Claude"), Op::N, ok))
             .unwrap();
         assert!(id > 0, "рівно 2000 символів мали пройти");
 
         let too_long = body_of_len(MAX_BODY_CHARS + 1);
         let err = store
-            .post(env(Agent::Grok, Agent::Claude, Op::N, too_long))
+            .post(env(ag("Grok"), ag("Claude"), Op::N, too_long))
             .unwrap_err();
         match err {
             Error::BodyTooLong { chars, max } => {
@@ -566,7 +574,7 @@ mod tests {
         }
 
         // Нічого не записано й не обрізано.
-        assert_eq!(store.inbox(Agent::Claude, false).unwrap().len(), 1);
+        assert_eq!(store.inbox(ag("Claude"), false).unwrap().len(), 1);
     }
 
     /// `to` не може дорівнювати `from` — але тільки буквально.
@@ -575,14 +583,14 @@ mod tests {
         let (_tmp, store) = tmp_store();
 
         let err = store
-            .post(env(Agent::Grok, Agent::Grok, Op::N, json!({"n": "сам собі"})))
+            .post(env(ag("Grok"), ag("Grok"), Op::N, json!({"n": "сам собі"})))
             .unwrap_err();
-        assert!(matches!(err, Error::SelfMessage(Agent::Grok)), "{err:?}");
+        assert!(matches!(&err, Error::SelfMessage(x) if *x == ag("Grok")), "{err:?}");
 
         let err = store
-            .post(env(Agent::Claude, Agent::Claude, Op::N, json!({})))
+            .post(env(ag("Claude"), ag("Claude"), Op::N, json!({})))
             .unwrap_err();
-        assert!(matches!(err, Error::SelfMessage(Agent::Claude)), "{err:?}");
+        assert!(matches!(&err, Error::SelfMessage(x) if *x == ag("Claude")), "{err:?}");
 
         // ⚠️ Тут була пара «всі→всі». Її теж не написати: відправником
         // тепер може бути лише конкретний агент.
@@ -590,11 +598,11 @@ mod tests {
         // А розсилка від конкретного агента — легальна (рішення №14),
         // навіть якщо він побачить її і в себе.
         let id = store
-            .post(env(Agent::Grok, Recipient::All, Op::N, json!({"n": "усім"})))
+            .post(env(ag("Grok"), Recipient::All, Op::N, json!({"n": "усім"})))
             .unwrap();
         assert!(id > 0);
-        assert_eq!(store.inbox(Agent::Grok, true).unwrap().len(), 1);
-        assert_eq!(store.inbox(Agent::Claude, true).unwrap().len(), 1);
+        assert_eq!(store.inbox(ag("Grok"), true).unwrap().len(), 1);
+        assert_eq!(store.inbox(ag("Claude"), true).unwrap().len(), 1);
     }
 
     /// Те саме, що [`env`], але з довільною темою: фільтр `topic` треба
@@ -620,21 +628,21 @@ mod tests {
     fn ack_many_ignores_foreign_and_missing() {
         let (_tmp, store) = tmp_store();
         let to_claude = store
-            .post(env(Agent::Grok, Agent::Claude, Op::Q, json!({"q": "ping"})))
+            .post(env(ag("Grok"), ag("Claude"), Op::Q, json!({"q": "ping"})))
             .unwrap();
 
         // Grok підтверджує чуже повідомлення й неіснуючий id.
-        assert_eq!(store.ack_many(&[to_claude], Agent::Grok).unwrap(), 0);
-        assert_eq!(store.ack_many(&[999_999], Agent::Grok).unwrap(), 0);
+        assert_eq!(store.ack_many(&[to_claude], ag("Grok")).unwrap(), 0);
+        assert_eq!(store.ack_many(&[999_999], ag("Grok")).unwrap(), 0);
         assert_eq!(
-            store.ack_many(&[to_claude, 999_999], Agent::Grok).unwrap(),
+            store.ack_many(&[to_claude, 999_999], ag("Grok")).unwrap(),
             0,
             "жоден id не мав зарахуватись"
         );
-        assert_eq!(store.ack_many(&[], Agent::Claude).unwrap(), 0);
+        assert_eq!(store.ack_many(&[], ag("Claude")).unwrap(), 0);
 
         // І чуже повідомлення лишилось непрочитаним у справжнього адресата.
-        let unread = store.inbox(Agent::Claude, true).unwrap();
+        let unread = store.inbox(ag("Claude"), true).unwrap();
         assert_eq!(unread.len(), 1);
         assert_eq!(unread[0].id, to_claude);
     }
@@ -645,36 +653,36 @@ mod tests {
     fn ack_many_counts_only_what_it_marked() {
         let (_tmp, store) = tmp_store();
         let a = store
-            .post(env(Agent::Grok, Agent::Claude, Op::Q, json!({"n": 1})))
+            .post(env(ag("Grok"), ag("Claude"), Op::Q, json!({"n": 1})))
             .unwrap();
         let b = store
-            .post(env(Agent::Grok, Recipient::All, Op::N, json!({"n": 2})))
+            .post(env(ag("Grok"), Recipient::All, Op::N, json!({"n": 2})))
             .unwrap();
         let c = store
-            .post(env(Agent::Claude, Agent::Grok, Op::N, json!({"n": 3})))
+            .post(env(ag("Claude"), ag("Grok"), Op::N, json!({"n": 3})))
             .unwrap();
 
         assert_eq!(
-            store.ack_many(&[a, b, c], Agent::Claude).unwrap(),
+            store.ack_many(&[a, b, c], ag("Claude")).unwrap(),
             2,
             "Claude мав підтвердити рівно свої два"
         );
 
         // Третє — Grokове, воно ціле й непрочитане.
-        let grok_unread = store.inbox(Agent::Grok, true).unwrap();
+        let grok_unread = store.inbox(ag("Grok"), true).unwrap();
         assert_eq!(grok_unread.len(), 1, "у Grok мало лишитись одне непрочитане");
         assert_eq!(grok_unread[0].id, c);
 
         // У Claude непрочитаних не лишилось.
-        assert!(store.inbox(Agent::Claude, true).unwrap().is_empty());
+        assert!(store.inbox(ag("Claude"), true).unwrap().is_empty());
 
         // Повторне підтвердження вже прочитаних — 0, і теж без помилки.
-        assert_eq!(store.ack_many(&[a, b], Agent::Claude).unwrap(), 0);
-        assert_eq!(store.ack_many(&[a, b, c], Agent::Claude).unwrap(), 0);
+        assert_eq!(store.ack_many(&[a, b], ag("Claude")).unwrap(), 0);
+        assert_eq!(store.ack_many(&[a, b, c], ag("Claude")).unwrap(), 0);
 
         // Grok свій id підтверджує сам — і рівно один раз.
-        assert_eq!(store.ack_many(&[c], Agent::Grok).unwrap(), 1);
-        assert_eq!(store.ack_many(&[c], Agent::Grok).unwrap(), 0);
+        assert_eq!(store.ack_many(&[c], ag("Grok")).unwrap(), 1);
+        assert_eq!(store.ack_many(&[c], ag("Grok")).unwrap(), 0);
     }
 
     /// `limit` віддає саме найновіші, у тому ж порядку (найстаріші першими).
@@ -685,14 +693,14 @@ mod tests {
         for n in 1..=5 {
             ids.push(
                 store
-                    .post(env(Agent::Grok, Agent::Claude, Op::N, json!({ "n": n })))
+                    .post(env(ag("Grok"), ag("Claude"), Op::N, json!({ "n": n })))
                     .unwrap(),
             );
         }
 
         let got = store
             .inbox_ex(InboxQuery {
-                agent: Recipient::One(Agent::Claude),
+                agent: Recipient::One(ag("Claude")),
                 limit: Some(2),
                 ..InboxQuery::default()
             })
@@ -706,7 +714,7 @@ mod tests {
         // Ліміт більший за наявне — усі п'ять, нічого не вигадано.
         let all = store
             .inbox_ex(InboxQuery {
-                agent: Recipient::One(Agent::Claude),
+                agent: Recipient::One(ag("Claude")),
                 limit: Some(99),
                 ..InboxQuery::default()
             })
@@ -716,7 +724,7 @@ mod tests {
         // Нуль — це нуль, а не «усі».
         let none = store
             .inbox_ex(InboxQuery {
-                agent: Recipient::One(Agent::Claude),
+                agent: Recipient::One(ag("Claude")),
                 limit: Some(0),
                 ..InboxQuery::default()
             })
@@ -730,16 +738,16 @@ mod tests {
         let (_tmp, store) = tmp_store();
         let full = json!({ "t": "a".repeat(50) });
         store
-            .post(env(Agent::Grok, Agent::Claude, Op::N, full.clone()))
+            .post(env(ag("Grok"), ag("Claude"), Op::N, full.clone()))
             .unwrap();
 
         // Без brief — тіло ціле, байт-у-байт.
-        let whole = store.inbox(Agent::Claude, false).unwrap();
+        let whole = store.inbox(ag("Claude"), false).unwrap();
         assert_eq!(whole[0].envelope.body, full);
 
         let cut = store
             .inbox_ex(InboxQuery {
-                agent: Recipient::One(Agent::Claude),
+                agent: Recipient::One(ag("Claude")),
                 brief: Some(10),
                 ..InboxQuery::default()
             })
@@ -759,7 +767,7 @@ mod tests {
         // Тіло, що вміщується у стелю, позначки не отримує.
         let short = store
             .inbox_ex(InboxQuery {
-                agent: Recipient::One(Agent::Claude),
+                agent: Recipient::One(ag("Claude")),
                 brief: Some(MAX_BODY_CHARS),
                 ..InboxQuery::default()
             })
@@ -769,15 +777,15 @@ mod tests {
         // Рядкове тіло ріжеться як рядок, не як JSON із лапками.
         store
             .post(env(
-                Agent::Grok,
-                Agent::Claude,
+                ag("Grok"),
+                ag("Claude"),
                 Op::N,
                 json!("б".repeat(30)),
             ))
             .unwrap();
         let cut = store
             .inbox_ex(InboxQuery {
-                agent: Recipient::One(Agent::Claude),
+                agent: Recipient::One(ag("Claude")),
                 limit: Some(1),
                 brief: Some(5),
                 ..InboxQuery::default()
@@ -795,16 +803,16 @@ mod tests {
         // Нормалізується в «xvid core».
         let spaced = store
             .post(env_topic(
-                Agent::Grok,
-                Agent::Claude,
+                ag("Grok"),
+                ag("Claude"),
                 "XVid  Core",
                 json!({"n": "пробіли"}),
             ))
             .unwrap();
         let plain = store
             .post(env_topic(
-                Agent::Grok,
-                Agent::Claude,
+                ag("Grok"),
+                ag("Claude"),
                 "xvid core",
                 json!({"n": "як є"}),
             ))
@@ -812,8 +820,8 @@ mod tests {
         // А це вже інша тема: слеш нормалізація не чіпає.
         store
             .post(env_topic(
-                Agent::Grok,
-                Agent::Claude,
+                ag("Grok"),
+                ag("Claude"),
                 "xvid/core",
                 json!({"n": "слеш"}),
             ))
@@ -826,7 +834,7 @@ mod tests {
 
         let got = store
             .inbox_ex(InboxQuery {
-                agent: Recipient::One(Agent::Claude),
+                agent: Recipient::One(ag("Claude")),
                 topic: Some("  xVid   CORE ".into()),
                 ..InboxQuery::default()
             })
@@ -837,7 +845,7 @@ mod tests {
 
         let slash = store
             .inbox_ex(InboxQuery {
-                agent: Recipient::One(Agent::Claude),
+                agent: Recipient::One(ag("Claude")),
                 topic: Some("XVID/Core".into()),
                 ..InboxQuery::default()
             })
@@ -848,7 +856,7 @@ mod tests {
         // Теми, якої немає, — порожньо, а не «усе».
         let empty = store
             .inbox_ex(InboxQuery {
-                agent: Recipient::One(Agent::Claude),
+                agent: Recipient::One(ag("Claude")),
                 topic: Some("нема такої".into()),
                 ..InboxQuery::default()
             })
@@ -862,15 +870,15 @@ mod tests {
     fn inbox_ex_exclude_own_is_opt_in() {
         let (_tmp, store) = tmp_store();
         let own = store
-            .post(env(Agent::Grok, Recipient::All, Op::N, json!({"n": "усім"})))
+            .post(env(ag("Grok"), Recipient::All, Op::N, json!({"n": "усім"})))
             .unwrap();
         let foreign = store
-            .post(env(Agent::Claude, Agent::Grok, Op::N, json!({"n": "тобі"})))
+            .post(env(ag("Claude"), ag("Grok"), Op::N, json!({"n": "тобі"})))
             .unwrap();
 
         let default = store
             .inbox_ex(InboxQuery {
-                agent: Recipient::One(Agent::Grok),
+                agent: Recipient::One(ag("Grok")),
                 ..InboxQuery::default()
             })
             .unwrap();
@@ -879,7 +887,7 @@ mod tests {
 
         let without_own = store
             .inbox_ex(InboxQuery {
-                agent: Recipient::One(Agent::Grok),
+                agent: Recipient::One(ag("Grok")),
                 exclude_own: true,
                 ..InboxQuery::default()
             })
@@ -895,37 +903,37 @@ mod tests {
     fn inbox_ex_default_equals_inbox() {
         let (_tmp, store) = tmp_store();
         store
-            .post(env(Agent::Grok, Agent::Claude, Op::Q, json!({"n": 1})))
+            .post(env(ag("Grok"), ag("Claude"), Op::Q, json!({"n": 1})))
             .unwrap();
         let both = store
-            .post(env(Agent::Grok, Recipient::All, Op::N, json!({"n": 2})))
+            .post(env(ag("Grok"), Recipient::All, Op::N, json!({"n": 2})))
             .unwrap();
         store
-            .post(env(Agent::Claude, Agent::Grok, Op::A, json!({"n": 3})))
+            .post(env(ag("Claude"), ag("Grok"), Op::A, json!({"n": 3})))
             .unwrap();
-        store.ack_many(&[both], Agent::Claude).unwrap();
+        store.ack_many(&[both], ag("Claude")).unwrap();
 
         // Дефолт запиту нікому не приписує чужої особи.
         assert_eq!(Recipient::default(), Recipient::All);
 
         for agent in [
-            Recipient::One(Agent::Grok),
-            Recipient::One(Agent::Claude),
+            Recipient::One(ag("Grok")),
+            Recipient::One(ag("Claude")),
             Recipient::All,
         ] {
-            let old = store.inbox(agent, false).unwrap();
+            let old = store.inbox(agent.clone(), false).unwrap();
             let new = store
                 .inbox_ex(InboxQuery {
-                    agent,
+                    agent: agent.clone(),
                     ..InboxQuery::default()
                 })
                 .unwrap();
             assert_eq!(old, new, "дефолтний запит розійшовся з inbox({agent}, false)");
 
-            let old_unread = store.inbox(agent, true).unwrap();
+            let old_unread = store.inbox(agent.clone(), true).unwrap();
             let new_unread = store
                 .inbox_ex(InboxQuery {
-                    agent,
+                    agent: agent.clone(),
                     unread_only: true,
                     ..InboxQuery::default()
                 })
@@ -937,7 +945,7 @@ mod tests {
     #[test]
     fn post_rejects_bad_version() {
         let (_tmp, store) = tmp_store();
-        let mut e = env(Agent::Grok, Agent::Claude, Op::A, json!({}));
+        let mut e = env(ag("Grok"), ag("Claude"), Op::A, json!({}));
         e.v = 2;
         let err = store.post(e).unwrap_err();
         assert!(matches!(err, Error::BadVersion(2)));
@@ -966,12 +974,12 @@ mod tests {
         let (tx, rx) = mpsc::channel();
 
         let mut handles = Vec::new();
-        for (store, holder) in [(a, Agent::Grok), (b, Agent::Claude)] {
+        for (store, holder) in [(a, ag("Grok")), (b, ag("Claude"))] {
             let gate = std::sync::Arc::clone(&gate);
             let tx = tx.clone();
             handles.push(std::thread::spawn(move || {
                 gate.wait();
-                let r = store.lock("гонка", holder, DEFAULT_TTL_SEC, "мій");
+                let r = store.lock("гонка", holder.clone(), DEFAULT_TTL_SEC, "мій");
                 let _ = tx.send((holder, r));
             }));
         }
@@ -1024,12 +1032,12 @@ mod tests {
 
         // post
         store
-            .post(env_topic(Agent::Grok, Agent::Claude, &ok, json!({"a": 1})))
+            .post(env_topic(ag("Grok"), ag("Claude"), &ok, json!({"a": 1})))
             .unwrap();
         let err = store
             .post(env_topic(
-                Agent::Grok,
-                Agent::Claude,
+                ag("Grok"),
+                ag("Claude"),
                 &too_long,
                 json!({"a": 1}),
             ))
@@ -1043,28 +1051,28 @@ mod tests {
         }
 
         // lock / lock_ex / unlock
-        store.lock(&ok, Agent::Grok, DEFAULT_TTL_SEC, "ок").unwrap();
+        store.lock(&ok, ag("Grok"), DEFAULT_TTL_SEC, "ок").unwrap();
         assert!(matches!(
             store
-                .lock(&too_long, Agent::Grok, DEFAULT_TTL_SEC, "ні")
+                .lock(&too_long, ag("Grok"), DEFAULT_TTL_SEC, "ні")
                 .unwrap_err(),
             Error::TopicTooLong { .. }
         ));
         assert!(matches!(
             store
-                .lock_ex(&too_long, Agent::Grok, DEFAULT_TTL_SEC, "ні")
+                .lock_ex(&too_long, ag("Grok"), DEFAULT_TTL_SEC, "ні")
                 .unwrap_err(),
             Error::TopicTooLong { .. }
         ));
         assert!(matches!(
-            store.unlock(&too_long, Agent::Grok).unwrap_err(),
+            store.unlock(&too_long, ag("Grok")).unwrap_err(),
             Error::TopicTooLong { .. }
         ));
-        store.unlock(&ok, Agent::Grok).unwrap();
+        store.unlock(&ok, ag("Grok")).unwrap();
 
         // Довга тема не осіла в базі жодним шляхом.
         assert!(store.locks().unwrap().is_empty());
-        let inbox = store.inbox(Agent::Claude, false).unwrap();
+        let inbox = store.inbox(ag("Claude"), false).unwrap();
         assert_eq!(inbox.len(), 1, "у базу проліз зайвий запис");
         assert_eq!(inbox[0].envelope.topic.chars().count(), MAX_TOPIC_CHARS);
     }
@@ -1078,7 +1086,7 @@ mod tests {
         let too_long = str_of_len(MAX_NOTE_CHARS + 1);
 
         store
-            .lock("xvid/core", Agent::Grok, DEFAULT_TTL_SEC, &ok)
+            .lock("xvid/core", ag("Grok"), DEFAULT_TTL_SEC, &ok)
             .unwrap();
         assert_eq!(
             store.locks().unwrap()[0].note.chars().count(),
@@ -1086,7 +1094,7 @@ mod tests {
         );
 
         let err = store
-            .lock("xvid/core", Agent::Grok, DEFAULT_TTL_SEC, &too_long)
+            .lock("xvid/core", ag("Grok"), DEFAULT_TTL_SEC, &too_long)
             .unwrap_err();
         match err {
             Error::NoteTooLong { chars, max } => {
@@ -1098,7 +1106,7 @@ mod tests {
 
         assert!(matches!(
             store
-                .lock_ex("xvid/core", Agent::Grok, DEFAULT_TTL_SEC, &too_long)
+                .lock_ex("xvid/core", ag("Grok"), DEFAULT_TTL_SEC, &too_long)
                 .unwrap_err(),
             Error::NoteTooLong { .. }
         ));
@@ -1116,35 +1124,35 @@ mod tests {
         let (_tmp, store) = tmp_store();
 
         let to_claude = store
-            .post(env(Agent::Grok, Agent::Claude, Op::Q, json!({"q": 1})))
+            .post(env(ag("Grok"), ag("Claude"), Op::Q, json!({"q": 1})))
             .unwrap();
         let to_grok = store
-            .post(env(Agent::Claude, Agent::Grok, Op::A, json!({"a": 1})))
+            .post(env(ag("Claude"), ag("Grok"), Op::A, json!({"a": 1})))
             .unwrap();
         let to_both = store
-            .post(env(Agent::Grok, Recipient::All, Op::N, json!({"n": 1})))
+            .post(env(ag("Grok"), Recipient::All, Op::N, json!({"n": 1})))
             .unwrap();
 
         // Чуже — false, без помилки, і чуже лишається непрочитаним.
-        assert!(!store.ack_one(to_grok, Agent::Claude).unwrap());
-        let grok_unread = store.inbox(Agent::Grok, true).unwrap();
+        assert!(!store.ack_one(to_grok, ag("Claude")).unwrap());
+        let grok_unread = store.inbox(ag("Grok"), true).unwrap();
         assert!(
             grok_unread.iter().any(|m| m.id == to_grok),
             "Claude погасив чуже повідомлення"
         );
 
         // Неіснуюче — теж false, а не NotFound.
-        assert!(!store.ack_one(999_999, Agent::Claude).unwrap());
+        assert!(!store.ack_one(999_999, ag("Claude")).unwrap());
 
         // Своє — true; повторно — false.
-        assert!(store.ack_one(to_claude, Agent::Claude).unwrap());
-        assert!(!store.ack_one(to_claude, Agent::Claude).unwrap());
+        assert!(store.ack_one(to_claude, ag("Claude")).unwrap());
+        assert!(!store.ack_one(to_claude, ag("Claude")).unwrap());
 
         // Both адресоване обом — Claude має право його погасити.
-        assert!(store.ack_one(to_both, Agent::Claude).unwrap());
+        assert!(store.ack_one(to_both, ag("Claude")).unwrap());
 
         let unread: Vec<i64> = store
-            .inbox(Agent::Claude, true)
+            .inbox(ag("Claude"), true)
             .unwrap()
             .iter()
             .map(|m| m.id)
@@ -1160,18 +1168,18 @@ mod tests {
         for n in 0..100 {
             old_ids.push(
                 store
-                    .post(env(Agent::Grok, Agent::Claude, Op::N, json!({ "n": n })))
+                    .post(env(ag("Grok"), ag("Claude"), Op::N, json!({ "n": n })))
                     .unwrap(),
             );
         }
-        assert_eq!(store.ack_many(&old_ids, Agent::Claude).unwrap(), 100);
+        assert_eq!(store.ack_many(&old_ids, ag("Claude")).unwrap(), 100);
         age_messages(&store, GC_READ_TTL_SEC + 1);
 
         let u1 = store
-            .post(env(Agent::Grok, Agent::Claude, Op::Q, json!({"q": "live-1"})))
+            .post(env(ag("Grok"), ag("Claude"), Op::Q, json!({"q": "live-1"})))
             .unwrap();
         let u2 = store
-            .post(env(Agent::Grok, Agent::Claude, Op::Q, json!({"q": "live-2"})))
+            .post(env(ag("Grok"), ag("Claude"), Op::Q, json!({"q": "live-2"})))
             .unwrap();
         assert_eq!(message_count(&store), 102, "до gc мають лежати всі 102");
 
@@ -1179,7 +1187,7 @@ mod tests {
         assert_eq!(dropped, 100, "мали зникнути рівно 100 старих прочитаних");
         assert_eq!(message_count(&store), 2);
 
-        let unread = store.inbox(Agent::Claude, true).unwrap();
+        let unread = store.inbox(ag("Claude"), true).unwrap();
         assert_eq!(unread.len(), 2);
         assert_eq!(unread[0].id, u1);
         assert_eq!(unread[1].id, u2);
@@ -1187,7 +1195,7 @@ mod tests {
         assert_eq!(unread[0].envelope.body, json!({"q": "live-1"}));
         assert_eq!(unread[1].envelope.body, json!({"q": "live-2"}));
 
-        let all = store.inbox(Agent::Claude, false).unwrap();
+        let all = store.inbox(ag("Claude"), false).unwrap();
         assert_eq!(all.len(), 2, "прочитані не мали лишитись у скриньці");
     }
 
@@ -1196,17 +1204,17 @@ mod tests {
     fn gc_keeps_recent_read_and_old_unread() {
         let (_tmp, store) = tmp_store();
         let old_unread = store
-            .post(env(Agent::Grok, Agent::Claude, Op::Q, json!({"q": "старе"})))
+            .post(env(ag("Grok"), ag("Claude"), Op::Q, json!({"q": "старе"})))
             .unwrap();
         age_messages(&store, GC_READ_TTL_SEC + 1);
         let recent = store
-            .post(env(Agent::Grok, Agent::Claude, Op::N, json!({"n": "свіже"})))
+            .post(env(ag("Grok"), ag("Claude"), Op::N, json!({"n": "свіже"})))
             .unwrap();
         store.ack(recent).unwrap();
 
         assert_eq!(store.gc_read().unwrap(), 0, "не мало що прибирати");
         assert_eq!(message_count(&store), 2);
-        let all = store.inbox(Agent::Claude, false).unwrap();
+        let all = store.inbox(ag("Claude"), false).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].id, old_unread);
         assert!(all[0].read_at.is_none());
@@ -1219,7 +1227,7 @@ mod tests {
     fn post_gcs_old_read_after_interval() {
         let (_tmp, store) = tmp_store();
         let old = store
-            .post(env(Agent::Grok, Agent::Claude, Op::N, json!({"n": "старе"})))
+            .post(env(ag("Grok"), ag("Claude"), Op::N, json!({"n": "старе"})))
             .unwrap();
         store.ack(old).unwrap();
         age_messages(&store, GC_READ_TTL_SEC + 1);
@@ -1228,10 +1236,10 @@ mod tests {
             .store(0, std::sync::atomic::Ordering::Relaxed);
 
         let live = store
-            .post(env(Agent::Grok, Agent::Claude, Op::Q, json!({"q": "живе"})))
+            .post(env(ag("Grok"), ag("Claude"), Op::Q, json!({"q": "живе"})))
             .unwrap();
         assert_eq!(message_count(&store), 1, "post мав прибрати старе прочитане");
-        let unread = store.inbox(Agent::Claude, true).unwrap();
+        let unread = store.inbox(ag("Claude"), true).unwrap();
         assert_eq!(unread.len(), 1);
         assert_eq!(unread[0].id, live);
     }
@@ -1241,13 +1249,13 @@ mod tests {
     fn post_skips_gc_within_interval() {
         let (_tmp, store) = tmp_store();
         let old = store
-            .post(env(Agent::Grok, Agent::Claude, Op::N, json!({"n": "старе"})))
+            .post(env(ag("Grok"), ag("Claude"), Op::N, json!({"n": "старе"})))
             .unwrap();
         store.ack(old).unwrap();
         // Перший post уже виставив last_gc; у межах години наступний не чистить.
         age_messages(&store, GC_READ_TTL_SEC + 1);
         store
-            .post(env(Agent::Grok, Agent::Claude, Op::Q, json!({"q": "живе"})))
+            .post(env(ag("Grok"), ag("Claude"), Op::Q, json!({"q": "живе"})))
             .unwrap();
         assert_eq!(
             message_count(&store),
@@ -1331,12 +1339,12 @@ mod tests {
         let store = Store::open(&path).unwrap();
 
         assert_eq!(
-            store.inbox(Agent::Grok, false).unwrap().len(),
+            store.inbox(ag("Grok"), false).unwrap().len(),
             1,
             "Grok мав побачити широкомовне, яке до міграції було «Both»"
         );
         assert_eq!(
-            store.inbox(Agent::Claude, false).unwrap().len(),
+            store.inbox(ag("Claude"), false).unwrap().len(),
             2,
             "Claude мав побачити і своє адресне, і широкомовне"
         );
@@ -1352,7 +1360,7 @@ mod tests {
         let (_tmp, store) = tmp_store();
         insert_legacy_broadcast(&store);
         assert_eq!(
-            store.inbox(Agent::Claude, true).unwrap().len(),
+            store.inbox(ag("Claude"), true).unwrap().len(),
             1,
             "старе написання широкомовної адреси мусить читатись назавжди"
         );
@@ -1364,10 +1372,10 @@ mod tests {
         let id = insert_legacy_broadcast(&store);
 
         assert!(
-            store.ack_one(id, Agent::Claude).unwrap(),
+            store.ack_one(id, ag("Claude")).unwrap(),
             "ack мав дістати широкомовне у старому написанні"
         );
-        assert!(store.inbox(Agent::Claude, true).unwrap().is_empty());
+        assert!(store.inbox(ag("Claude"), true).unwrap().is_empty());
     }
 
     #[test]
@@ -1379,6 +1387,99 @@ mod tests {
             Recipient::parse("Both!").is_err(),
             "толерантність не мала розповзтися на схожі рядки"
         );
+    }
+
+    // ── Ім'я агента: довільне, але перевірене ───────────────────────────
+
+    /// ⚠️ Головний тест цього зрізу: сервер більше не знає, як звуть агентів.
+    ///
+    /// Пара `Grok`+`Claude` — наш випадок, а не властивість протоколу. Тут
+    /// працюють імена, яких у коді немає взагалі, і саме це має бути видно
+    /// тому, хто прийде з іншим набором ШІ.
+    #[test]
+    fn arbitrary_agent_names_work_end_to_end() {
+        let (_tmp, store) = tmp_store();
+        let codex = ag("Codex");
+        let gemini = ag("gemini-2.5-pro");
+
+        let personal = store
+            .post(env(codex.clone(), gemini.clone(), Op::Q, json!({"q": "?"})))
+            .unwrap();
+        let broadcast = store
+            .post(env(gemini.clone(), Recipient::All, Op::N, json!({"n": "усім"})))
+            .unwrap();
+
+        let inbox = store.inbox(gemini.clone(), true).unwrap();
+        assert_eq!(
+            inbox.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![personal, broadcast],
+            "адресат мав побачити і особисте, і розсилку"
+        );
+        assert_eq!(
+            store.inbox(codex.clone(), true).unwrap().len(),
+            1,
+            "відправникові лишається тільки чужа розсилка"
+        );
+
+        assert!(store.ack_one(personal, gemini.clone()).unwrap());
+        assert!(
+            !store.ack_one(personal, codex.clone()).unwrap(),
+            "чуже не підтверджується — правило не залежить від імені"
+        );
+
+        store.lock("тема", codex.clone(), MIN_TTL_SEC, "працюю").unwrap();
+        assert_eq!(store.locks().unwrap()[0].holder, codex);
+        assert!(store.lock("тема", gemini, MIN_TTL_SEC, "теж").is_err());
+    }
+
+    #[test]
+    fn agent_names_are_checked() {
+        for good in ["Grok", "Claude", "Codex", "gpt-4o", "a", "x_1.2-3"] {
+            assert!(Agent::new(good).is_ok(), "«{good}» мало пройти");
+        }
+        for bad in ["", "*", "Both ", "два слова", "кирилиця", "a/b", "a:b"] {
+            assert!(
+                Agent::new(bad).is_err(),
+                "«{bad}» не мало пройти"
+            );
+        }
+        let long = "x".repeat(MAX_AGENT_CHARS);
+        assert!(Agent::new(&long).is_ok(), "рівно стеля — можна");
+        assert!(
+            Agent::new(&format!("{long}x")).is_err(),
+            "на символ довше — вже ні"
+        );
+    }
+
+    /// ⚠️ `*` відхиляється з ОКРЕМОЮ помилкою, а не як «недозволений символ».
+    ///
+    /// Різниця не косметична: `*` — не друкарська помилка в імені, а спроба
+    /// вжити адресу там, де потрібна особистість. Людина має прочитати саме
+    /// це, інакше шукатиме, який символ завадив.
+    #[test]
+    fn broadcast_as_an_actor_says_what_is_actually_wrong() {
+        assert!(matches!(Agent::parse(BROADCAST), Err(Error::BothCannotLock)));
+        assert!(matches!(
+            Agent::parse(BROADCAST_LEGACY),
+            Err(Error::BothCannotLock)
+        ));
+        assert!(matches!(
+            Agent::new(BROADCAST),
+            Err(Error::BadAgentName { .. })
+        ));
+    }
+
+    /// Десеріалізація перевіряє ім'я, а не приймає будь-який рядок.
+    ///
+    /// Інакше агент на ім'я `*` заходив би через `agent_talk.md` або через
+    /// аргумент інструмента — повз усі перевірки конструктора.
+    #[test]
+    fn deserialising_an_agent_validates_the_name() {
+        let ok: Agent = serde_json::from_str("\"Codex\"").unwrap();
+        assert_eq!(ok.as_str(), "Codex");
+        assert!(serde_json::from_str::<Agent>("\"*\"").is_err());
+        assert!(serde_json::from_str::<Agent>("\"два слова\"").is_err());
+        assert_eq!(serde_json::to_string(&ok).unwrap(), "\"Codex\"");
     }
 
     // ── Ролі: діяч і адреса — різні типи ────────────────────────────────
@@ -1448,7 +1549,7 @@ mod tests {
     /// Тому serde для `Recipient` написаний вручну, і саме це тут закріплено.
     #[test]
     fn recipient_serialises_as_a_plain_string() {
-        let one = serde_json::to_string(&Recipient::One(Agent::Grok)).unwrap();
+        let one = serde_json::to_string(&Recipient::One(ag("Grok"))).unwrap();
         let all = serde_json::to_string(&Recipient::All).unwrap();
         assert_eq!(one, "\"Grok\"");
         assert_eq!(all, "\"*\"");
