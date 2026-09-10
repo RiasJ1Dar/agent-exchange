@@ -782,6 +782,79 @@ mod tests {
         assert!(names.contains(&"lock_status"), "{names:?}");
     }
 
+    /// ⚠️ Схеми інструментів **не перелічують імена агентів**.
+    ///
+    /// Це те, що бачить чужий клієнт: `enum: ["Grok","Claude"]` у схемі
+    /// означав би для нього, що інші імена недозволені, — навіть якби сервер
+    /// їх приймав. Тобто перелік тут не косметика, а обіцянка протоколу.
+    ///
+    /// Тест дивиться на всі схеми одразу, а не на окремі поля: додати сьоме
+    /// поле з переліком легше, ніж згадати про нього в шести перевірках.
+    #[test]
+    fn tool_schemas_never_enumerate_agent_names() {
+        let (_dir, mcp) = tmp_mcp();
+        let list = mcp
+            .handle_rpc(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+            .unwrap();
+        let raw = serde_json::to_string(&list["result"]["tools"]).unwrap();
+
+        for name in ["Grok", "Claude", "Both"] {
+            assert!(
+                !raw.contains(&format!("\"{name}\"")),
+                "схема інструмента згадує ім'я «{name}» як значення: {raw}"
+            );
+        }
+        assert!(
+            raw.contains("pattern"),
+            "поля агентів мають описуватись шаблоном: {raw}"
+        );
+    }
+
+    /// Довільне ім'я проходить наскрізь через MCP, а не лише через `store`.
+    #[test]
+    fn an_unknown_agent_name_works_through_the_tools() {
+        let _guard = with_agent_name(None);
+        let (_dir, mcp) = tmp_mcp();
+
+        let posted = call(
+            &mcp,
+            1,
+            "post",
+            json!({
+                "from": "gemini-2.5-pro",
+                "to": "Codex",
+                "topic": "t",
+                "op": "N",
+                "body": {}
+            }),
+        );
+        assert!(!is_error(&posted), "{posted}");
+
+        let inbox = call(&mcp, 2, "inbox", json!({ "agent": "Codex" }));
+        let msgs = tool_json(&inbox)["messages"].as_array().unwrap().clone();
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert_eq!(msgs[0]["envelope"]["from"], "gemini-2.5-pro");
+    }
+
+    /// ⚠️ `Both` як ІМ'Я відхиляється, хоч і складається з дозволених літер.
+    ///
+    /// У схемі v1 колонка `to_agent` тримає саме цей рядок, і SQL звіряє з
+    /// ним досі — бо `ui` мігрувати не вміє. Агент, що назвався б так, читав
+    /// би всі чужі розсилки в кожній недомігрованій базі.
+    #[test]
+    fn the_legacy_broadcast_word_is_not_a_usable_agent_name() {
+        let _guard = with_agent_name(None);
+        let (_dir, mcp) = tmp_mcp();
+
+        let posted = call(
+            &mcp,
+            1,
+            "post",
+            json!({ "from": "Both", "to": "Grok", "topic": "t", "op": "N", "body": {} }),
+        );
+        assert!(is_error(&posted), "{posted}");
+    }
+
     #[test]
     fn lock_status_on_empty_store_is_empty_list() {
         let (_dir, mcp) = tmp_mcp();
@@ -906,9 +979,15 @@ mod tests {
         EnvGuard { prev, _lock: lock }
     }
 
+    /// ⚠️ Регістр значущий, і це змінена поведінка.
+    ///
+    /// Раніше `AGENT_NAME` звірявся з переліком `Grok`/`Claude` без
+    /// урахування регістру, тож `claude` давало `Claude`. Переліку більше
+    /// немає — сервер не знає імен, — а отже, немає й канонічної форми:
+    /// `Codex` і `codex` це просто різні агенти.
     #[test]
     fn post_without_from_takes_identity_from_env() {
-        let _guard = with_agent_name(Some("claude"));
+        let _guard = with_agent_name(Some("Claude"));
         let (_dir, mcp) = tmp_mcp();
 
         let posted = call(
@@ -922,7 +1001,7 @@ mod tests {
         let inbox = call(&mcp, 2, "inbox", json!({ "agent": "Grok" }));
         let msgs = tool_json(&inbox)["messages"].as_array().unwrap().clone();
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0]["envelope"]["from"], "Claude", "регістр нормалізовано");
+        assert_eq!(msgs[0]["envelope"]["from"], "Claude", "ім'я взято з env як є");
     }
 
     #[test]
@@ -942,9 +1021,34 @@ mod tests {
         assert!(text.contains(AGENT_NAME_ENV), "{text}");
     }
 
+    /// ⚠️ Тест перевернувся навмисно: раніше він звався
+    /// `alien_agent_name_is_rejected_with_the_allowed_list` і вимагав, щоб
+    /// незнайоме ім'я відхилялось із переліком дозволених.
+    ///
+    /// Тепер переліку немає — у цьому й суть R6. Сервер перевіряє **форму**
+    /// імені, а не належність до списку, бо не він вирішує, як звуть
+    /// агентів. Що лишилось незмінним — негодяща форма далі відхиляється.
     #[test]
-    fn alien_agent_name_is_rejected_with_the_allowed_list() {
-        let _guard = with_agent_name(Some("hacker"));
+    fn any_well_formed_agent_name_is_accepted_from_env() {
+        let _guard = with_agent_name(Some("Codex"));
+        let (_dir, mcp) = tmp_mcp();
+
+        let posted = call(
+            &mcp,
+            1,
+            "post",
+            json!({ "to": "Grok", "topic": "xvid/core", "op": "N", "body": {} }),
+        );
+        assert!(!is_error(&posted), "{posted}");
+
+        let inbox = call(&mcp, 2, "inbox", json!({ "agent": "Grok" }));
+        let msgs = tool_json(&inbox)["messages"].as_array().unwrap().clone();
+        assert_eq!(msgs[0]["envelope"]["from"], "Codex");
+    }
+
+    #[test]
+    fn a_malformed_agent_name_from_env_is_still_rejected() {
+        let _guard = with_agent_name(Some("два слова"));
         let (_dir, mcp) = tmp_mcp();
 
         let posted = call(
@@ -955,8 +1059,8 @@ mod tests {
         );
         assert!(is_error(&posted), "{posted}");
         let text = tool_text(&posted);
-        assert!(text.contains("hacker"), "{text}");
-        assert!(text.contains("Grok") && text.contains("Claude"), "{text}");
+        assert!(text.contains("два слова"), "{text}");
+        assert!(text.contains(AGENT_NAME_ENV), "{text}");
     }
 
     #[test]
@@ -997,7 +1101,7 @@ mod tests {
 
     #[test]
     fn lock_and_unlock_without_holder_take_identity_from_env() {
-        let _guard = with_agent_name(Some("GROK"));
+        let _guard = with_agent_name(Some("Grok"));
         let (_dir, mcp) = tmp_mcp();
 
         let locked = call(&mcp, 1, "lock", json!({ "topic": "xvid/core", "ttl_sec": 300 }));
