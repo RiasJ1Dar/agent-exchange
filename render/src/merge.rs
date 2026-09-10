@@ -1,13 +1,11 @@
 use crate::talk::TALK_NAME;
 use exchange_store::{Lock, Message, Op, Recipient};
+use std::collections::BTreeMap;
 
-/// Імена, під які зроблені лічильники дошки.
-///
-/// ⚠️ Тимчасове: сервер уже не знає імен, а дошка ще знає. Етап 5 замінює
-/// ці лічильники на побудовані з того, що реально є в базі.
-const GROK: &str = "Grok";
-/// Див. [`GROK`].
-const CLAUDE: &str = "Claude";
+/// Що писати в рядку лічильників, поки в обміні немає жодного агента.
+const NO_AGENTS: &str = "агентів ще немає";
+
+
 use std::borrow::Cow;
 use std::fmt::Write as FmtWrite;
 
@@ -84,46 +82,81 @@ pub(crate) fn build_lock_block(locks: &[Lock]) -> String {
 /// залежати від того, що там міняється паралельно.
 #[derive(Default)]
 struct Unread {
-    q_grok: usize,
-    q_claude: usize,
-    personal_grok: usize,
-    personal_claude: usize,
+    /// Непрочитане по агентах. `BTreeMap`, а не `HashMap`: порядок рядків на
+    /// дошці має бути сталим, інакше вони стрибали б між рендерами.
+    ///
+    /// ⚠️ Ключі беруться з самого обміну (`from` і `to` повідомлень), а не з
+    /// переліку в коді. Сервер не знає, як звуть агентів, — і дошка теж не
+    /// має знати: інакше третій учасник просто не з'явився б у лічильниках.
+    per_agent: BTreeMap<String, AgentUnread>,
+    /// Широкомовні, які не є питаннями.
     broadcast: usize,
+}
+
+/// Скільки непрочитаного чекає на одного агента.
+#[derive(Default)]
+struct AgentUnread {
+    /// Питання: адресовані йому особисто **або** всім.
+    questions: usize,
+    /// Адресне не-питання. Широкомовне сюди не потрапляє.
+    personal: usize,
 }
 
 impl Unread {
     /// Черга питань порожня — рядок має сказати це спокійно, без ⚠️.
     fn no_questions(&self) -> bool {
-        self.q_grok == 0 && self.q_claude == 0
+        self.per_agent.values().all(|u| u.questions == 0)
+    }
+
+    /// «Ім'я — число» через кому, у сталому порядку.
+    fn line(&self, pick: impl Fn(&AgentUnread) -> usize) -> String {
+        if self.per_agent.is_empty() {
+            return NO_AGENTS.to_string();
+        }
+        self.per_agent
+            .iter()
+            .map(|(name, u)| format!("{name} — {}", pick(u)))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
 fn tally_unread(msgs: &[Message]) -> Unread {
     let mut t = Unread::default();
-    // ⚠️ Імена звіряються рядками, а не варіантами переліку: `Agent` більше
-    // не enum. Самі рядки `Grok`/`Claude` тут поки лишаються — лічильники
-    // дошки прив'язані до пари агентів, і це прибирає етап 5, а не цей.
+
+    // ⚠️ Спершу — хто взагалі бере участь в обміні. Учасники беруться з
+    // повідомлень, бо іншого джерела немає: у сервера немає ні переліку
+    // агентів, ні конфігу з іменами.
+    //
+    // Рахується і `from`: агент, якому ще ніхто не написав, усе одно має
+    // з'явитись на дошці з нулями — інакше людина не побачить, що він тут.
+    for m in msgs {
+        t.per_agent.entry(m.envelope.from.to_string()).or_default();
+        if let Recipient::One(a) = &m.envelope.to {
+            t.per_agent.entry(a.as_str().to_string()).or_default();
+        }
+    }
+
     for m in msgs.iter().filter(|m| m.read_at.is_none()) {
         let to = &m.envelope.to;
-        let all = matches!(to, Recipient::All);
-        let named = |name: &str| matches!(to, Recipient::One(a) if a.as_str() == name);
-        if m.envelope.op == Op::Q {
-            // Питання перебиває адресата: `Q` на всіх — це питання
-            // кожному, а не широкомовний статус.
-            if all || named(GROK) {
-                t.q_grok += 1;
+        let question = m.envelope.op == Op::Q;
+        match to {
+            // Питання всім — питання кожному, а не широкомовний статус:
+            // саме воно чекає на відповідь.
+            Recipient::All if question => {
+                for u in t.per_agent.values_mut() {
+                    u.questions += 1;
+                }
             }
-            if all || named(CLAUDE) {
-                t.q_claude += 1;
+            Recipient::All => t.broadcast += 1,
+            Recipient::One(a) => {
+                let u = t.per_agent.entry(a.as_str().to_string()).or_default();
+                if question {
+                    u.questions += 1;
+                } else {
+                    u.personal += 1;
+                }
             }
-            continue;
-        }
-        if all {
-            t.broadcast += 1;
-        } else if named(GROK) {
-            t.personal_grok += 1;
-        } else if named(CLAUDE) {
-            t.personal_claude += 1;
         }
     }
     t
@@ -186,14 +219,16 @@ pub(crate) fn build_inbox_block(msgs: &[Message]) -> String {
     } else {
         let _ = writeln!(
             &mut s,
-            "- ⚠️ питань без відповіді: Grok — {}, Claude — {}",
-            t.q_grok, t.q_claude
+            "- ⚠️ питань без відповіді: {}",
+            t.line(|u| u.questions)
         );
     }
+    // Рядок стоїть завжди, навіть на порожньому обміні: зникла структура
+    // дошки читається як збій рендера, а не як «нікого немає».
     let _ = writeln!(
         &mut s,
-        "- особистих непрочитаних: Grok — {}, Claude — {}",
-        t.personal_grok, t.personal_claude
+        "- особистих непрочитаних: {}",
+        t.line(|u| u.personal)
     );
     let _ = writeln!(&mut s, "- широкомовних: {}", t.broadcast);
 
