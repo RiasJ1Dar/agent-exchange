@@ -14,8 +14,8 @@ pub use messages::{
     MAX_BODY_CHARS,
 };
 pub use sign::{
-    canonical, from_hex, to_hex, verify, Key, CANON_TAG, KEY_BYTES, SIGNABLE_ENVELOPE_V,
-    SIG_BYTES,
+    canonical, from_hex, to_hex, verify, Key, Trust, Trusted, CANON_TAG, KEY_BYTES,
+    SIGNABLE_ENVELOPE_V, SIG_BYTES,
 };
 pub use locks::{
     normalize_topic, Evicted, Lock, LockOutcome, MAX_NOTE_CHARS, MAX_TOPIC_CHARS,
@@ -40,6 +40,13 @@ pub struct Store {
     /// знати, звідки взявся ключ. Виставляє його `mcp` через
     /// [`Store::with_key`] — там же, де читаються решта налаштувань.
     key: Option<sign::Key>,
+    /// Публічні ключі, якими перевіряються вхідні підписи.
+    ///
+    /// ⚠️ `None` і порожній перелік — різні стани. `None` означає «підпис
+    /// ніхто не вимагає»; порожній перелік — «конфіг є, але в ньому нікого»,
+    /// і тоді теж нема чим звіряти. Плутати їх не можна: у першому випадку
+    /// підпис не потрібен, у другому його просто нема з чим порівняти.
+    trusted: Option<sign::Trusted>,
     /// Unix-час останнього авто-gc. `0` — ще не було: перший `post`/`ack`
     /// на цьому з'єднанні прибере прочитане старші за [`GC_READ_TTL_SEC`].
     last_gc_unix: AtomicI64,
@@ -66,6 +73,17 @@ impl Store {
     /// Чи підписує цей `Store` те, що пише.
     pub fn signs(&self) -> bool {
         self.key.is_some()
+    }
+
+    /// Увімкнути перевірку вхідних підписів.
+    pub fn with_trusted(mut self, trusted: Option<sign::Trusted>) -> Self {
+        self.trusted = trusted;
+        self
+    }
+
+    /// Чи звіряє цей `Store` підписи прочитаного.
+    pub fn verifies(&self) -> bool {
+        self.trusted.is_some()
     }
 
     pub(crate) fn conn(&self) -> Result<MutexGuard<'_, Connection>, Error> {
@@ -1511,6 +1529,178 @@ mod tests {
         let (sig, key_id) = sig_of(&store, notified);
         assert!(sig.is_some(), "сповіщення лишилось без підпису");
         assert_eq!(key_id.as_deref(), Some("claude-1"));
+    }
+
+    // ── Перевірка підпису при читанні ───────────────────────────────────
+
+    fn trusted_with(pairs: &[(&str, &str)]) -> Trusted {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("agents.json");
+        let json: String = format!(
+            "{{{}}}",
+            pairs
+                .iter()
+                .map(|(n, k)| format!("\"{n}\":\"{k}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        std::fs::write(&path, json).unwrap();
+        let t = Trusted::from_file(&path).unwrap();
+        // `dir` тримається до кінця виразу — файл уже прочитано.
+        t
+    }
+
+    /// ⚠️ Те, заради чого весь R5: **чужим ім'ям підписатись не можна**.
+    ///
+    /// Сценарій буквальний. Grok має свій ключ і пише від імені Claude —
+    /// підписуючи, звісно, власним ключем, бо чужого приватного в нього
+    /// немає. Перевірка бере публічний ключ Claude і не сходиться.
+    ///
+    /// Саме це не закриває HMAC зі спільним секретом: там той самий секрет
+    /// і перевіряє, і підписує.
+    #[test]
+    fn signing_under_someone_elses_name_is_caught() {
+        let dir = TempDir::new().unwrap();
+        let claude = Key::from_seed(&[1u8; KEY_BYTES], "claude-1").unwrap();
+        let grok = Key::from_seed(&[2u8; KEY_BYTES], "grok-1").unwrap();
+        let trusted = trusted_with(&[
+            ("Claude", &claude.public_hex()),
+            ("Grok", &grok.public_hex()),
+        ]);
+
+        // Grok пише «від Claude», підписуючи своїм ключем.
+        let store = Store::open(&dir.path().join("a.db"))
+            .unwrap()
+            .with_key(Some(grok))
+            .with_trusted(Some(trusted));
+        store
+            .post(env(ag("Claude"), ag("Grok"), Op::N, json!({"n": "не я"})))
+            .unwrap();
+
+        let got = store.all_messages().unwrap();
+        assert!(
+            matches!(&got[0].trust, Trust::Broken { .. }),
+            "підпис чужим ім'ям пройшов: {:?}",
+            got[0].trust
+        );
+    }
+
+    #[test]
+    fn a_message_signed_by_its_own_owner_is_trusted() {
+        let dir = TempDir::new().unwrap();
+        let grok = Key::from_seed(&[2u8; KEY_BYTES], "grok-1").unwrap();
+        let trusted = trusted_with(&[("Grok", &grok.public_hex())]);
+
+        let store = Store::open(&dir.path().join("a.db"))
+            .unwrap()
+            .with_key(Some(grok))
+            .with_trusted(Some(trusted));
+        store
+            .post(env(ag("Grok"), ag("Claude"), Op::N, json!({})))
+            .unwrap();
+
+        let got = store.all_messages().unwrap();
+        assert_eq!(
+            got[0].trust,
+            Trust::Valid {
+                key_id: "grok-1".into()
+            }
+        );
+    }
+
+    /// Агент, чий ключ у переліку, але рядок без підпису — це `Broken`.
+    ///
+    /// ⚠️ Саме тут ловиться найтихіший випадок: підпис не підробили, його
+    /// просто не поставили. Якби це рахувалось «непідписаним», обійти
+    /// перевірку можна було б, просто не підписуючи.
+    #[test]
+    fn a_missing_signature_from_a_known_agent_is_broken() {
+        let dir = TempDir::new().unwrap();
+        let grok = Key::from_seed(&[2u8; KEY_BYTES], "grok-1").unwrap();
+        let trusted = trusted_with(&[("Grok", &grok.public_hex())]);
+
+        // Пишемо БЕЗ ключа, читаємо з переліком.
+        let store = Store::open(&dir.path().join("a.db"))
+            .unwrap()
+            .with_trusted(Some(trusted));
+        store
+            .post(env(ag("Grok"), ag("Claude"), Op::N, json!({})))
+            .unwrap();
+
+        let got = store.all_messages().unwrap();
+        assert!(
+            matches!(&got[0].trust, Trust::Broken { why } if why.contains("не підписаний")),
+            "{:?}",
+            got[0].trust
+        );
+    }
+
+    /// Агента немає в переліку — перевіряти нічим, і це не «зламано».
+    #[test]
+    fn an_agent_outside_the_list_is_simply_unverified() {
+        let dir = TempDir::new().unwrap();
+        let grok = Key::from_seed(&[2u8; KEY_BYTES], "grok-1").unwrap();
+        let trusted = trusted_with(&[("Grok", &grok.public_hex())]);
+
+        let store = Store::open(&dir.path().join("a.db"))
+            .unwrap()
+            .with_trusted(Some(trusted));
+        store
+            .post(env(ag("Codex"), ag("Grok"), Op::N, json!({})))
+            .unwrap();
+
+        assert_eq!(store.all_messages().unwrap()[0].trust, Trust::Unsigned);
+    }
+
+    /// Без переліку не перевіряється нічого — поведінка як до R5.
+    #[test]
+    fn without_a_list_nothing_is_verified() {
+        let (_tmp, store) = tmp_store();
+        assert!(!store.verifies());
+        store
+            .post(env(ag("Grok"), ag("Claude"), Op::N, json!({})))
+            .unwrap();
+        assert_eq!(store.all_messages().unwrap()[0].trust, Trust::Unsigned);
+    }
+
+    /// Обидва місця читання мають судити однаково.
+    ///
+    /// ⚠️ `inbox` і `all_messages` — різні запити. Якби оцінку рахувало
+    /// лише одне з них, те саме повідомлення виглядало б по-різному
+    /// залежно від того, звідки його взяли.
+    #[test]
+    fn inbox_and_all_messages_agree_on_trust() {
+        let dir = TempDir::new().unwrap();
+        let grok = Key::from_seed(&[2u8; KEY_BYTES], "grok-1").unwrap();
+        let trusted = trusted_with(&[("Grok", &grok.public_hex())]);
+
+        let store = Store::open(&dir.path().join("a.db"))
+            .unwrap()
+            .with_key(Some(grok))
+            .with_trusted(Some(trusted));
+        store
+            .post(env(ag("Grok"), ag("Claude"), Op::N, json!({})))
+            .unwrap();
+
+        let from_inbox = store.inbox(ag("Claude"), false).unwrap();
+        let from_all = store.all_messages().unwrap();
+        assert_eq!(from_inbox[0].trust, from_all[0].trust);
+        assert!(matches!(from_inbox[0].trust, Trust::Valid { .. }));
+    }
+
+    #[test]
+    fn a_broken_key_list_is_an_error_not_a_silent_skip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("agents.json");
+
+        std::fs::write(&path, "не json").unwrap();
+        assert!(matches!(Trusted::from_file(&path), Err(Error::BadKey(_))));
+
+        std::fs::write(&path, r#"{"Grok":"короткий"}"#).unwrap();
+        assert!(
+            matches!(Trusted::from_file(&path), Err(Error::BadKey(_))),
+            "ключ не тієї довжини мав бути помилкою"
+        );
     }
 
     // ── Схема v3: місце під підпис ──────────────────────────────────────

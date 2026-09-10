@@ -49,6 +49,13 @@ pub const KEY_ENV: &str = "EXCHANGE_KEY";
 /// ключ — старі рядки лишились підписані старим, і за `key_id` видно, яким).
 pub const KEY_ID_ENV: &str = "EXCHANGE_KEY_ID";
 
+/// Шлях до JSON з публічними ключами агентів: `{"ім'я": "hex"}`.
+///
+/// Не задано — вхідні підписи ніхто не звіряє, і всі повідомлення
+/// позначаються як непідписані. Це не «небезпечний режим», а той самий
+/// стан, що й до R5: перевіряти нічим, поки ключами не обмінялись.
+pub const TRUSTED_ENV: &str = "EXCHANGE_AGENTS";
+
 /// Скільки символів тіла віддавати, коли агент розгрібає чергу
 /// (`inbox` з `unread_only = true`) і сам стелі не назвав.
 ///
@@ -104,6 +111,15 @@ pub struct Mcp {
 /// без підпису. Людина, яка виставила `EXCHANGE_KEY`, розраховує, що
 /// повідомлення підписуються; мовчазний відкат означав би, що вона про це
 /// не дізнається, поки хтось не спробує перевірити підпис.
+fn trusted_from_env() -> Result<Option<exchange_store::Trusted>, Error> {
+    let Some(path) = std::env::var(TRUSTED_ENV).ok().filter(|v| !v.trim().is_empty()) else {
+        return Ok(None);
+    };
+    Ok(Some(exchange_store::Trusted::from_file(Path::new(
+        path.trim(),
+    ))?))
+}
+
 fn key_from_env() -> Result<Option<exchange_store::Key>, Error> {
     let Some(path) = std::env::var(KEY_ENV).ok().filter(|v| !v.trim().is_empty()) else {
         return Ok(None);
@@ -121,7 +137,9 @@ fn key_from_env() -> Result<Option<exchange_store::Key>, Error> {
 impl Mcp {
     pub fn open(db: &Path, now_md: &Path) -> Result<Self, Error> {
         Ok(Self {
-            store: Store::open(db)?.with_key(key_from_env()?),
+            store: Store::open(db)?
+                .with_key(key_from_env()?)
+                .with_trusted(trusted_from_env()?),
             now_md: now_md.to_path_buf(),
         })
     }

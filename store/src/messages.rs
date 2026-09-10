@@ -272,6 +272,12 @@ pub struct Message {
     pub ts_unix: i64,
     pub envelope: Envelope,
     pub read_at: Option<i64>,
+    /// Що відомо про підпис цього рядка.
+    ///
+    /// ⚠️ Поле віддається читачеві, а не використовується для мовчазного
+    /// відсіювання: сховане повідомлення виглядає як мовчання відправника.
+    #[serde(default = "crate::sign::unsigned")]
+    pub trust: crate::sign::Trust,
 }
 
 /// Позначка обрізаного тіла — саме вона робить обрізання видимим.
@@ -343,6 +349,51 @@ fn brief_body(body: serde_json::Value, n: usize) -> serde_json::Value {
             }
         }
     }
+}
+
+/// Скласти [`Message`] з рядка таблиці й одразу оцінити його підпис.
+///
+/// Спільна для обох місць читання навмисне: розійшовшись, вони дали б
+/// найгірше — одна вибірка звіряла б підпис, а друга ні, і те саме
+/// повідомлення виглядало б по-різному залежно від того, звідки його взяли.
+#[allow(clippy::too_many_arguments)]
+fn build_message(
+    id: i64,
+    ts_unix: i64,
+    v: u32,
+    from: &str,
+    to: &str,
+    topic: String,
+    op: &str,
+    body: &str,
+    read_at: Option<i64>,
+    sig: Option<String>,
+    key_id: Option<String>,
+    trusted: Option<&crate::sign::Trusted>,
+) -> Result<Message, Error> {
+    let envelope = Envelope {
+        v,
+        from: Agent::parse(from)?,
+        to: Recipient::parse(to)?,
+        topic,
+        op: Op::parse(op)?,
+        body: serde_json::from_str(body)?,
+    };
+    // Немає переліку ключів — нема з чим звіряти, і це не привід не вірити.
+    let trust = match trusted {
+        Some(t) => {
+            let canon = crate::sign::canonical(&envelope, ts_unix)?;
+            t.judge(from, &canon, sig.as_deref(), key_id.as_deref())
+        }
+        None => crate::sign::Trust::Unsigned,
+    };
+    Ok(Message {
+        id,
+        ts_unix,
+        envelope,
+        read_at,
+        trust,
+    })
 }
 
 /// Запис повідомлення **на вже взятому** з'єднанні.
@@ -499,8 +550,9 @@ impl crate::Store {
     /// цілком, а не суму відомих скриньок.
     pub fn all_messages(&self) -> Result<Vec<Message>, Error> {
         let conn = self.conn()?;
+        let trusted = self.trusted.as_ref();
         let mut stmt = conn.prepare(
-            "SELECT id, ts_unix, v, from_agent, to_agent, topic, op, body, read_at
+            "SELECT id, ts_unix, v, from_agent, to_agent, topic, op, body, read_at, sig, key_id
              FROM messages
              ORDER BY id ASC",
         )?;
@@ -515,24 +567,17 @@ impl crate::Store {
                 row.get::<_, String>(6)?,
                 row.get::<_, String>(7)?,
                 row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, ts_unix, v, from, to, topic, op, body, read_at) = row?;
-            out.push(Message {
-                id,
-                ts_unix,
-                envelope: Envelope {
-                    v: v as u32,
-                    from: Agent::parse(&from)?,
-                    to: Recipient::parse(&to)?,
-                    topic,
-                    op: Op::parse(&op)?,
-                    body: serde_json::from_str(&body)?,
-                },
-                read_at,
-            });
+            let (id, ts_unix, v, from, to, topic, op, body, read_at, sig, key_id) = row?;
+            out.push(build_message(
+                id, ts_unix, v as u32, &from, &to, topic, &op, &body, read_at, sig, key_id,
+                trusted,
+            )?);
         }
         Ok(out)
     }
@@ -547,7 +592,7 @@ impl crate::Store {
     pub fn inbox_ex(&self, q: InboxQuery) -> Result<Vec<Message>, Error> {
         let mut out = {
             let conn = self.conn()?;
-            Self::read_inbox(&conn, &q.agent, q.unread_only)?
+            Self::read_inbox(&conn, &q.agent, q.unread_only, self.trusted.as_ref())?
         };
 
         if q.exclude_own {
@@ -585,18 +630,19 @@ impl crate::Store {
         conn: &Connection,
         agent: &Recipient,
         unread_only: bool,
+        trusted: Option<&crate::sign::Trusted>,
     ) -> Result<Vec<Message>, Error> {
         // ⚠️ Широкомовна адреса перевіряється в ОБОХ написаннях, і це не
         // тимчасовий місток на час міграції. База може бути на схемі v1 —
         // чужа копія, копія для перевірки, або та, яку відкрив read-only
         // процес, що мігрувати не вміє за побудовою.
         let sql = if unread_only {
-            "SELECT id, ts_unix, v, from_agent, to_agent, topic, op, body, read_at
+            "SELECT id, ts_unix, v, from_agent, to_agent, topic, op, body, read_at, sig, key_id
              FROM messages
              WHERE (to_agent = ?1 OR to_agent IN ('*','Both')) AND read_at IS NULL
              ORDER BY id ASC"
         } else {
-            "SELECT id, ts_unix, v, from_agent, to_agent, topic, op, body, read_at
+            "SELECT id, ts_unix, v, from_agent, to_agent, topic, op, body, read_at, sig, key_id
              FROM messages
              WHERE (to_agent = ?1 OR to_agent IN ('*','Both'))
              ORDER BY id ASC"
@@ -613,24 +659,17 @@ impl crate::Store {
                 row.get::<_, String>(6)?,
                 row.get::<_, String>(7)?,
                 row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, ts_unix, v, from, to, topic, op, body, read_at) = row?;
-            out.push(Message {
-                id,
-                ts_unix,
-                envelope: Envelope {
-                    v,
-                    from: Agent::parse(&from)?,
-                    to: Recipient::parse(&to)?,
-                    topic,
-                    op: Op::parse(&op)?,
-                    body: serde_json::from_str(&body)?,
-                },
-                read_at,
-            });
+            let (id, ts_unix, v, from, to, topic, op, body, read_at, sig, key_id) = row?;
+            out.push(build_message(
+                id, ts_unix, v, &from, &to, topic, &op, &body, read_at, sig, key_id,
+                trusted,
+            )?);
         }
         Ok(out)
     }

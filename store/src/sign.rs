@@ -6,6 +6,7 @@
 //! підпису: він іноді сходиться, а іноді ні, і винним виглядає ключ.
 
 use crate::messages::{Envelope, ENVELOPE_V};
+use serde::{Deserialize, Serialize};
 use crate::Error;
 
 /// Позначка формату на початку канонічного рядка.
@@ -190,6 +191,118 @@ pub fn verify(public_hex: &str, canonical: &str, sig_hex: &str) -> bool {
     };
     vk.verify_strict(canonical.as_bytes(), &Signature::from_bytes(&sig))
         .is_ok()
+}
+
+/// Стан підпису одного повідомлення, як його бачить читач.
+///
+/// ⚠️ Це поле **віддається назовні**, а не використовується для мовчазного
+/// відсіювання. Сховати повідомлення з негодящим підписом було б гірше:
+/// адресат не побачив би ні листа, ні причини, і вирішив би, що відправник
+/// мовчить. Позначка робить проблему видимою й лишає рішення людині.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Trust {
+    /// Підпису немає, і його ніхто не вимагав. Звичайний стан там, де
+    /// підпис не вмикали.
+    Unsigned,
+    /// Підпис є і сходиться публічним ключем відправника.
+    Valid {
+        /// Яким ключем підписано — з колонки `key_id`.
+        key_id: String,
+    },
+    /// Підпис є, але не сходиться; або його немає там, де він обов'язковий.
+    ///
+    /// Причина в тексті, бо ці випадки лікуються по-різному: «не той ключ»
+    /// означає підміну або зміну ключа, а «немає підпису» — що агент пише
+    /// без ключа, хоч його публічний ключ уже роздали.
+    Broken {
+        /// Що саме не так — людською мовою.
+        why: String,
+    },
+}
+
+/// Дефолт для serde: рядок без відомостей про підпис.
+pub fn unsigned() -> Trust {
+    Trust::Unsigned
+}
+
+/// Публічні ключі агентів: ім'я → ключ у hex.
+///
+/// ⚠️ Порожній перелік і **відсутній** перелік — різні речі, і плутати їх
+/// не можна. Немає конфігу — підпис ніхто не вимагає, усе `Unsigned`.
+/// Конфіг є, але агента в ньому немає — його підпис не перевіряється, бо
+/// нема чим; це теж `Unsigned`, а не `Broken`.
+#[derive(Debug, Clone, Default)]
+pub struct Trusted {
+    keys: std::collections::BTreeMap<String, String>,
+}
+
+impl Trusted {
+    /// Прочитати конфіг: JSON-обʼєкт `{"ім'я": "публічний ключ у hex"}`.
+    pub fn from_file(path: &std::path::Path) -> Result<Self, Error> {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| Error::BadKey(format!("{}: {e}", path.display())))?;
+        let keys: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&raw).map_err(|e| {
+                Error::BadKey(format!("{}: очікував JSON-обʼєкт: {e}", path.display()))
+            })?;
+        for (name, hex) in &keys {
+            let ok = from_hex(hex).map(|b| b.len() == KEY_BYTES).unwrap_or(false);
+            if !ok {
+                return Err(Error::BadKey(format!(
+                    "{}: ключ «{name}» має бути {} hex-символів",
+                    path.display(),
+                    KEY_BYTES * 2
+                )));
+            }
+        }
+        Ok(Trusted { keys })
+    }
+
+    /// Скільки агентів у переліку.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Чи перелік порожній.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Оцінити підпис одного повідомлення.
+    ///
+    /// `sig` і `key_id` — те, що лежить у рядку; `canonical` — подання, яке
+    /// підписували.
+    pub fn judge(
+        &self,
+        from: &str,
+        canonical: &str,
+        sig: Option<&str>,
+        key_id: Option<&str>,
+    ) -> Trust {
+        let Some(public) = self.keys.get(from) else {
+            // Ключа цього агента нам не давали — перевіряти нічим.
+            // Це не привід не вірити: підпис може бути й правильним.
+            return Trust::Unsigned;
+        };
+        let Some(sig) = sig else {
+            return Trust::Broken {
+                why: format!(
+                    "від «{from}» очікується підпис (його ключ є в переліку), \
+                     а рядок не підписаний"
+                ),
+            };
+        };
+        if verify(public, canonical, sig) {
+            Trust::Valid {
+                key_id: key_id.unwrap_or("").to_string(),
+            }
+        } else {
+            Trust::Broken {
+                why: format!("підпис від «{from}» не сходиться його публічним ключем"),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
