@@ -39,40 +39,78 @@ pub const BROADCAST: &str = "*";
 /// може за побудовою, тож він завжди може побачити схему v1.
 pub const BROADCAST_LEGACY: &str = "Both";
 
+/// Стеля довжини імені агента.
+///
+/// 64 — з запасом для будь-якого розумного імені й водночас достатньо мало,
+/// щоб ім'я лишалось читабельним у рядку дошки й у журналі.
+pub const MAX_AGENT_CHARS: usize = 64;
+
 /// Конкретний агент — той, хто **діє**: пише, підтверджує, тримає замок.
 ///
-/// ⚠️ Тут навмисно **немає** широкомовного варіанта, і це не спрощення.
-/// Раніше «всі» був третім значенням цього ж типу, тож підписати повідомлення
-/// від імені всіх або взяти замок «усіма» було синтаксично можливо — і від
-/// цього рятували чотири рантайм-перевірки `matches!(holder, Both)`,
-/// розкидані по `locks`. Тепер це гарантує тип: те, чого не можна зробити,
-/// не можна навіть написати.
+/// ⚠️ Тут навмисно **немає** широкомовного варіанта. Раніше «всі» був третім
+/// значенням цього ж типу, тож підписати повідомлення від імені всіх або
+/// взяти замок «усіма» було синтаксично можливо — і від цього рятували
+/// рантайм-перевірки, розкидані по `locks`. Тепер це гарантує тип.
 ///
 /// Адреса, за якою повідомлення **отримують**, — окремий тип [`Recipient`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Agent {
-    Grok,
-    Claude,
-}
+///
+/// ⚠️ Ім'я — довільний рядок, а не перелік. Сервер не має знати, як звуть
+/// агентів: пара `Grok`+`Claude` — це наш випадок, а не властивість
+/// протоколу. Чужа людина з іншим набором ШІ має **налаштувати**, а не
+/// форкати.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Agent(String);
 
 impl Agent {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Agent::Grok => "Grok",
-            Agent::Claude => "Claude",
+    /// Перевірити ім'я і зробити з нього агента.
+    ///
+    /// Правила навмисне вузькі: ім'я лягає в SQL, у JSON журналу, у рядок
+    /// дошки й у назву файла ключа (R5). Розширити перелік символів колись
+    /// можна; звузити після того, як хтось назветься — уже ні.
+    pub fn new(name: &str) -> Result<Self, Error> {
+        if name.is_empty() {
+            return Err(Error::BadAgentName {
+                name: name.to_string(),
+                why: "порожнє ім'я".into(),
+            });
         }
+        let chars = name.chars().count();
+        if chars > MAX_AGENT_CHARS {
+            return Err(Error::BadAgentName {
+                name: name.to_string(),
+                why: format!("{chars} символів, стеля {MAX_AGENT_CHARS}"),
+            });
+        }
+        // ⚠️ `*` не проходить сюди саме через цей перелік — окремої перевірки
+        // на нього немає навмисне, бо окрему легше загубити при правці.
+        // Агент на ім'я `*` читав би всю чужу пошту.
+        if let Some(bad) = name
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        {
+            return Err(Error::BadAgentName {
+                name: name.to_string(),
+                why: format!("недозволений символ «{bad}»; можна A-Z a-z 0-9 _ - ."),
+            });
+        }
+        Ok(Agent(name.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 
     /// Розбір імені діяча з бази або з аргументів інструмента.
     ///
     /// Широкомовні написання тут — **помилка**, а не значення: відправником
-    /// чи тримачем замка «всі» бути не можуть.
+    /// чи тримачем замка «всі» бути не можуть. Помилка при цьому окрема від
+    /// «недозволений символ»: `*` — не друкарська помилка в імені, а спроба
+    /// вжити адресу там, де потрібна особистість.
     pub(crate) fn parse(s: &str) -> Result<Self, Error> {
-        match s {
-            "Grok" => Ok(Agent::Grok),
-            "Claude" => Ok(Agent::Claude),
-            other => Err(Error::UnknownAgent(other.to_string())),
+        if s == BROADCAST || s == BROADCAST_LEGACY {
+            return Err(Error::BothCannotLock);
         }
+        Agent::new(s)
     }
 }
 
@@ -82,11 +120,28 @@ impl std::fmt::Display for Agent {
     }
 }
 
+/// ⚠️ Serde вручну з тієї ж причини, що й у [`Recipient`]: ім'я має лишатись
+/// простим рядком у JSON. Плюс десеріалізація **перевіряє** — інакше через
+/// `agent_talk.md` чи аргумент інструмента міг би зайти агент на ім'я `*`.
+impl Serialize for Agent {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Agent {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        Agent::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Кому адресовано: конкретному агентові або всім.
 ///
 /// Окремий тип від [`Agent`], бо це інша роль. Адресатом може бути «всі»;
 /// відправником — ніколи.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+// ⚠️ Не `Copy`: ім'я агента тепер рядок, а не варіант переліку.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Recipient {
     /// Особисто цьому агентові.
     One(Agent),
@@ -102,7 +157,7 @@ pub enum Recipient {
 }
 
 impl Recipient {
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Recipient::One(a) => a.as_str(),
             Recipient::All => BROADCAST,
@@ -293,7 +348,9 @@ pub(crate) fn post_with_conn(conn: &Connection, env: Envelope) -> Result<i64, Er
     }
     // Заборонена лише **буквальна** рівність: from=Grok, to=All — легальна
     // розсилка, хоч Grok і побачить її у власному inbox.
-    if Recipient::One(env.from) == env.to {
+    // Порівняння через посилання: ім'я більше не `Copy`, і конверт має
+    // доїхати до `INSERT` цілим.
+    if matches!(&env.to, Recipient::One(to) if *to == env.from) {
         return Err(Error::SelfMessage(env.from));
     }
     // Тема міряється нарівні з тілом: без цього стеля тіла обходилась
@@ -314,9 +371,12 @@ pub(crate) fn post_with_conn(conn: &Connection, env: Envelope) -> Result<i64, Er
         params![
             now,
             env.v,
+            // ⚠️ Рядки беруться ДО того, як `env` частинами переїде далі:
+            // ім'я більше не `Copy`, і позичити його після переміщення
+            // компілятор не дасть.
             env.from.as_str(),
             env.to.as_str(),
-            env.topic,
+            env.topic.as_str(),
             env.op.as_str(),
             body
         ],
@@ -392,6 +452,53 @@ impl crate::Store {
         })
     }
 
+    /// Усі повідомлення, найстаріші першими — незалежно від адресата.
+    ///
+    /// ⚠️ Це не те саме, що об'єднати скриньки всіх агентів, і саме тому
+    /// метод окремий. `render` раніше читав скриньки `Grok` і `Claude` й
+    /// зшивав результати — тобто **знав імена** й загубив би повідомлення
+    /// третього агента, щойно той з'явився б. Журнал має показувати обмін
+    /// цілком, а не суму відомих скриньок.
+    pub fn all_messages(&self) -> Result<Vec<Message>, Error> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, ts_unix, v, from_agent, to_agent, topic, op, body, read_at
+             FROM messages
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, ts_unix, v, from, to, topic, op, body, read_at) = row?;
+            out.push(Message {
+                id,
+                ts_unix,
+                envelope: Envelope {
+                    v: v as u32,
+                    from: Agent::parse(&from)?,
+                    to: Recipient::parse(&to)?,
+                    topic,
+                    op: Op::parse(&op)?,
+                    body: serde_json::from_str(&body)?,
+                },
+                read_at,
+            });
+        }
+        Ok(out)
+    }
+
     /// Скринька з фільтрами — див. [`InboxQuery`].
     ///
     /// Порядок фільтрів важливий і саме такий: спершу відсіюється зайве
@@ -402,13 +509,13 @@ impl crate::Store {
     pub fn inbox_ex(&self, q: InboxQuery) -> Result<Vec<Message>, Error> {
         let mut out = {
             let conn = self.conn()?;
-            Self::read_inbox(&conn, q.agent, q.unread_only)?
+            Self::read_inbox(&conn, &q.agent, q.unread_only)?
         };
 
         if q.exclude_own {
             // При `q.agent = All` не виключається ніхто: своєю скринька
             // «лише розсилки» не буває.
-            out.retain(|m| Recipient::One(m.envelope.from) != q.agent);
+            out.retain(|m| Recipient::One(m.envelope.from.clone()) != q.agent);
         }
         if let Some(topic) = q.topic.as_deref() {
             let want = normalize_topic(topic);
@@ -438,7 +545,7 @@ impl crate::Store {
     /// який брав би гард удруге, завис би тихо.
     fn read_inbox(
         conn: &Connection,
-        agent: Recipient,
+        agent: &Recipient,
         unread_only: bool,
     ) -> Result<Vec<Message>, Error> {
         // ⚠️ Широкомовна адреса перевіряється в ОБОХ написаннях, і це не

@@ -18,6 +18,13 @@ pub enum Error {
     BadVersion(u32),
     #[error("невідомий агент у БД: {0}")]
     UnknownAgent(String),
+    /// Ім'я не пройшло перевірку [`crate::Agent::new`].
+    ///
+    /// Окремо від [`Error::UnknownAgent`] навмисне: там питання «хто це»,
+    /// тут — «так називатись не можна». Причина в тексті, бо саме її людина
+    /// має прочитати, а не гадати, який символ завадив.
+    #[error("негодяще ім'я агента «{name}»: {why}")]
+    BadAgentName { name: String, why: String },
     #[error("невідома операція у БД: {0}")]
     UnknownOp(String),
     #[error("не вдалося ввімкнути WAL, journal_mode={0}")]

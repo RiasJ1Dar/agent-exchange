@@ -1,4 +1,4 @@
-use exchange_store::{Agent, Recipient, Store};
+use exchange_store::Store;
 use std::io::ErrorKind;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -104,14 +104,9 @@ fn render_locked(store: &Store, now_md: &Path) -> Result<(), Error> {
     // Повна вибірка: `agent_talk.md` — журнал, а лічильник
     // `ще M прочитаних` рахує ack-нуті. Стеля непрочитаних живе
     // уже в `build_inbox_block`, не в SQL.
-    let mut msgs = store.inbox(Recipient::One(Agent::Grok), false)?;
-    let extra = store.inbox(Recipient::One(Agent::Claude), false)?;
-    for m in extra {
-        if !msgs.iter().any(|x| x.id == m.id) {
-            msgs.push(m);
-        }
-    }
-    msgs.sort_by_key(|m| m.id);
+    // ⚠️ Раніше тут читались скриньки `Grok` і `Claude` та зшивались за id.
+    // Це зашивало імена в `render` і мовчки загубило б третього агента.
+    let msgs = store.all_messages()?;
 
     let lock_block = build_lock_block(&locks);
     let inbox_block = build_inbox_block(&msgs);
@@ -383,6 +378,13 @@ mod tests {
     use std::time::SystemTime;
     use tempfile::tempdir;
 
+    /// Ім'я агента для тесту. Паніка на негодящому — навмисно: у тестах
+    /// імена задані руками, і мовчазний `Result` тут лише ховав би друкарську
+    /// помилку в самому тесті.
+    fn ag(name: &str) -> Agent {
+        Agent::new(name).expect("ім'я агента в тесті має бути валідним")
+    }
+
     fn sample_envelope(
         from: Agent,
         to: impl Into<Recipient>,
@@ -433,9 +435,9 @@ mod tests {
         let now = dir.path().join("NOW.md");
         let store = Store::open(&db).unwrap();
 
-        store.lock("alpha", Agent::Grok, 90, "hold").unwrap();
+        store.lock("alpha", ag("Grok"), 90, "hold").unwrap();
         let id = store
-            .post(sample_envelope(Agent::Claude, Agent::Grok, "alpha", Op::Q))
+            .post(sample_envelope(ag("Claude"), ag("Grok"), "alpha", Op::Q))
             .unwrap();
 
         render(&store, &now).unwrap();
@@ -474,9 +476,9 @@ mod tests {
 
         let store = Store::open(&db).unwrap();
         store
-            .post(sample_envelope(Agent::Grok, Agent::Claude, "beta", Op::N))
+            .post(sample_envelope(ag("Grok"), ag("Claude"), "beta", Op::N))
             .unwrap();
-        store.lock("beta", Agent::Claude, 15, "note").unwrap();
+        store.lock("beta", ag("Claude"), 15, "note").unwrap();
         drop(store);
 
         render_now(RenderOpts {
@@ -519,9 +521,9 @@ mod tests {
         fs::write(&now, handwritten()).unwrap();
 
         let store = Store::open(&db).unwrap();
-        store.lock("alpha", Agent::Grok, 90, "hold").unwrap();
+        store.lock("alpha", ag("Grok"), 90, "hold").unwrap();
         store
-            .post(sample_envelope(Agent::Claude, Agent::Grok, "alpha", Op::Q))
+            .post(sample_envelope(ag("Claude"), ag("Grok"), "alpha", Op::Q))
             .unwrap();
 
         render(&store, &now).unwrap();
@@ -562,17 +564,17 @@ mod tests {
         fs::write(&now, handwritten()).unwrap();
 
         let store = Store::open(&db).unwrap();
-        store.lock("alpha", Agent::Grok, 90, "hold").unwrap();
+        store.lock("alpha", ag("Grok"), 90, "hold").unwrap();
         render(&store, &now).unwrap();
         let first = fs::read_to_string(&now).unwrap();
 
         // Стан бази змінився — вміст блоків має оновитись.
-        store.unlock("alpha", Agent::Grok).unwrap();
+        store.unlock("alpha", ag("Grok")).unwrap();
         // TTL береться в межах [MIN_TTL_SEC, MAX_TTL_SEC] крейта store,
         // інакше значення клампиться і в блок потрапляє не воно.
-        store.lock("gamma", Agent::Claude, 4200, "новий").unwrap();
+        store.lock("gamma", ag("Claude"), 4200, "новий").unwrap();
         let id = store
-            .post(sample_envelope(Agent::Grok, Agent::Claude, "gamma", Op::N))
+            .post(sample_envelope(ag("Grok"), ag("Claude"), "gamma", Op::N))
             .unwrap();
 
         render(&store, &now).unwrap();
@@ -603,7 +605,7 @@ mod tests {
         fs::write(&now, handwritten()).unwrap();
 
         let store = Store::open(&db).unwrap();
-        store.lock("alpha", Agent::Grok, 90, "hold").unwrap();
+        store.lock("alpha", ag("Grok"), 90, "hold").unwrap();
 
         render(&store, &now).unwrap();
         render(&store, &log).unwrap();
@@ -645,7 +647,7 @@ mod tests {
         let now = dir.path().join("NOW.md");
         fs::write(&now, format!("\u{feff}{}", handwritten())).unwrap();
         let store = Store::open(&db).unwrap();
-        store.lock("alpha", Agent::Grok, 90, "hold").unwrap();
+        store.lock("alpha", ag("Grok"), 90, "hold").unwrap();
         render(&store, &now).unwrap();
         let raw = fs::read(&now).unwrap();
         assert_eq!(&raw[..3], &[0xEF, 0xBB, 0xBF]);
@@ -701,7 +703,7 @@ mod tests {
         fs::write(&now, format!("{LOCK_BEGIN}\nсирота\n\n{}", handwritten())).unwrap();
 
         let store = Store::open(&db).unwrap();
-        store.lock("alpha", Agent::Grok, 90, "hold").unwrap();
+        store.lock("alpha", ag("Grok"), 90, "hold").unwrap();
 
         refuses_and_keeps_bytes(&now, &store);
 
@@ -755,7 +757,7 @@ mod tests {
         fs::write(&now, &text).unwrap();
 
         let store = Store::open(&db).unwrap();
-        store.lock("alpha", Agent::Grok, 90, "hold").unwrap();
+        store.lock("alpha", ag("Grok"), 90, "hold").unwrap();
 
         refuses_and_keeps_bytes(&now, &store);
 
@@ -812,7 +814,7 @@ mod tests {
         fs::write(&now, "").unwrap();
 
         let store = Store::open(&db).unwrap();
-        store.lock("alpha", Agent::Grok, 90, "hold").unwrap();
+        store.lock("alpha", ag("Grok"), 90, "hold").unwrap();
         render(&store, &now).unwrap();
 
         let text = fs::read_to_string(&now).unwrap();
@@ -902,9 +904,9 @@ mod tests {
         fs::write(&now, handwritten().replace('\n', CRLF)).unwrap();
 
         let store = Store::open(&db).unwrap();
-        store.lock("alpha", Agent::Grok, 90, "hold").unwrap();
+        store.lock("alpha", ag("Grok"), 90, "hold").unwrap();
         store
-            .post(sample_envelope(Agent::Claude, Agent::Grok, "alpha", Op::Q))
+            .post(sample_envelope(ag("Claude"), ag("Grok"), "alpha", Op::Q))
             .unwrap();
 
         render(&store, &now).unwrap();
@@ -914,10 +916,10 @@ mod tests {
         exactly_four_real_markers(&first, "CRLF");
 
         // Друга ітерація: заміна вмісту блоків у вже CRLF-файлі.
-        store.unlock("alpha", Agent::Grok).unwrap();
-        store.lock("gamma", Agent::Claude, 4200, "новий").unwrap();
+        store.unlock("alpha", ag("Grok")).unwrap();
+        store.lock("gamma", ag("Claude"), 4200, "новий").unwrap();
         store
-            .post(sample_envelope(Agent::Grok, Agent::Claude, "gamma", Op::N))
+            .post(sample_envelope(ag("Grok"), ag("Claude"), "gamma", Op::N))
             .unwrap();
 
         render(&store, &now).unwrap();
@@ -977,7 +979,7 @@ mod tests {
         let store = Store::open(&db).unwrap();
 
         let id = store
-            .post(sample_envelope(Agent::Claude, Agent::Grok, "alpha", Op::Q))
+            .post(sample_envelope(ag("Claude"), ag("Grok"), "alpha", Op::Q))
             .unwrap();
         render(&store, &now).unwrap();
 
@@ -1054,13 +1056,13 @@ mod tests {
 
         let store = Store::open(&db).unwrap();
         let a = store
-            .post(sample_envelope(Agent::Claude, Agent::Grok, "alpha", Op::Q))
+            .post(sample_envelope(ag("Claude"), ag("Grok"), "alpha", Op::Q))
             .unwrap();
         let b = store
-            .post(sample_envelope(Agent::Grok, Agent::Claude, "beta", Op::A))
+            .post(sample_envelope(ag("Grok"), ag("Claude"), "beta", Op::A))
             .unwrap();
         let c = store
-            .post(sample_envelope(Agent::Grok, Recipient::All, "gamma", Op::N))
+            .post(sample_envelope(ag("Grok"), Recipient::All, "gamma", Op::N))
             .unwrap();
         store.ack(a).unwrap();
 
@@ -1104,7 +1106,7 @@ mod tests {
 
         let store = Store::open(&db).unwrap();
         store
-            .post(sample_envelope(Agent::Grok, Agent::Claude, "alpha", Op::N))
+            .post(sample_envelope(ag("Grok"), ag("Claude"), "alpha", Op::N))
             .unwrap();
 
         render(&store, &log).unwrap();
@@ -1125,13 +1127,13 @@ mod tests {
 
         let store = Store::open(&db).unwrap();
         store
-            .post(sample_envelope(Agent::Claude, Agent::Grok, "alpha", Op::Q))
+            .post(sample_envelope(ag("Claude"), ag("Grok"), "alpha", Op::Q))
             .unwrap();
         render(&store, &now).unwrap();
         assert_eq!(parsed_talk(&now).len(), 1);
 
         store
-            .post(sample_envelope(Agent::Grok, Agent::Claude, "beta", Op::A))
+            .post(sample_envelope(ag("Grok"), ag("Claude"), "beta", Op::A))
             .unwrap();
         render(&store, &now).unwrap();
 
@@ -1155,14 +1157,14 @@ mod tests {
 
         let store = Store::open(&db).unwrap();
         let read_one = store
-            .post(sample_envelope(Agent::Claude, Agent::Grok, "alpha", Op::Q))
+            .post(sample_envelope(ag("Claude"), ag("Grok"), "alpha", Op::Q))
             .unwrap();
         store.ack(read_one).unwrap();
         store
-            .post(sample_envelope(Agent::Claude, Agent::Grok, "beta", Op::N))
+            .post(sample_envelope(ag("Claude"), ag("Grok"), "beta", Op::N))
             .unwrap();
         let last = store
-            .post(sample_envelope(Agent::Grok, Recipient::All, "gamma", Op::A))
+            .post(sample_envelope(ag("Grok"), Recipient::All, "gamma", Op::A))
             .unwrap();
 
         render(&store, &now).unwrap();
@@ -1221,8 +1223,8 @@ mod tests {
             let op = if i % 7 == 0 { Op::Q } else { Op::N };
             let id = store
                 .post(sample_envelope(
-                    Agent::Claude,
-                    Agent::Grok,
+                    ag("Claude"),
+                    ag("Grok"),
                     &format!("m{i}"),
                     op,
                 ))
@@ -1306,7 +1308,7 @@ mod tests {
         for i in 0..3 {
             store
                 .post(sample_envelope(
-                    Agent::Claude,
+                    ag("Claude"),
                     Recipient::All,
                     &format!("q{i}"),
                     Op::Q,
@@ -1316,7 +1318,7 @@ mod tests {
         for i in 0..10 {
             store
                 .post(sample_envelope(
-                    Agent::Claude,
+                    ag("Claude"),
                     Recipient::All,
                     &format!("w{i}-ok"),
                     Op::N,
@@ -1369,18 +1371,18 @@ mod tests {
         let store = Store::open(&db).unwrap();
         store
             .post(sample_envelope(
-                Agent::Claude,
-                Agent::Grok,
+                ag("Claude"),
+                ag("Grok"),
                 "особисте",
                 Op::N,
             ))
             .unwrap();
         store
-            .post(sample_envelope(Agent::Grok, Agent::Claude, "теж", Op::A))
+            .post(sample_envelope(ag("Grok"), ag("Claude"), "теж", Op::A))
             .unwrap();
         store
             .post(sample_envelope(
-                Agent::Grok,
+                ag("Grok"),
                 Recipient::All,
                 "apk 15.74 MB",
                 Op::N,
@@ -1413,7 +1415,7 @@ mod tests {
         for i in 0..5 {
             store
                 .post(sample_envelope(
-                    Agent::Grok,
+                    ag("Grok"),
                     Recipient::All,
                     &format!("uniffi-ok {i}"),
                     Op::N,
@@ -1423,8 +1425,8 @@ mod tests {
         // Ack-нуте питання теж не має піднімати тривогу.
         let answered = store
             .post(sample_envelope(
-                Agent::Claude,
-                Agent::Grok,
+                ag("Claude"),
+                ag("Grok"),
                 "закрите",
                 Op::Q,
             ))
@@ -1484,7 +1486,7 @@ mod tests {
         let now = dir.path().join("NOW.md");
 
         let store = Store::open(&db).unwrap();
-        let mut env = sample_envelope(Agent::Claude, Agent::Grok, "тема\nз переносом", Op::Q);
+        let mut env = sample_envelope(ag("Claude"), ag("Grok"), "тема\nз переносом", Op::Q);
         env.body = serde_json::json!({
             "рядки": "перший\nдругий\r\nтретій",
             "лапки": "він сказав \"так\"",
@@ -1572,7 +1574,7 @@ mod tests {
         fs::write(&now, handwritten()).unwrap();
 
         let store = Store::open(&db).unwrap();
-        let mut env = sample_envelope(Agent::Claude, Agent::Grok, "alpha", Op::Q);
+        let mut env = sample_envelope(ag("Claude"), ag("Grok"), "alpha", Op::Q);
         env.body = serde_json::json!({
             "про": format!("блок inbox закривається так: {INBOX_END}"),
             "ще": format!("а замок так: {LOCK_END}"),
@@ -1616,7 +1618,7 @@ mod tests {
         let store = Store::open(&db).unwrap();
         let topic = format!("про {INBOX_END} і {INBOX_BEGIN}");
         store
-            .post(sample_envelope(Agent::Claude, Agent::Grok, &topic, Op::N))
+            .post(sample_envelope(ag("Claude"), ag("Grok"), &topic, Op::N))
             .unwrap();
 
         render(&store, &now).unwrap();
@@ -1643,14 +1645,14 @@ mod tests {
         store
             .lock(
                 "alpha",
-                Agent::Grok,
+                ag("Grok"),
                 90,
                 &format!("тримаю, поки не поясню {LOCK_END}"),
             )
             .unwrap();
         // ...і окремий замок із маркером у самій темі.
         store
-            .lock(&format!("beta {LOCK_BEGIN}"), Agent::Claude, 120, "друга")
+            .lock(&format!("beta {LOCK_BEGIN}"), ag("Claude"), 120, "друга")
             .unwrap();
 
         render(&store, &now).unwrap();
@@ -1679,9 +1681,9 @@ mod tests {
 
         let store = Store::open(&db).unwrap();
         store
-            .lock("alpha", Agent::Grok, 90, "стрілка -> і тег <b>, мінус --")
+            .lock("alpha", ag("Grok"), 90, "стрілка -> і тег <b>, мінус --")
             .unwrap();
-        let mut env = sample_envelope(Agent::Claude, Agent::Grok, "тема без стрілок", Op::Q);
+        let mut env = sample_envelope(ag("Claude"), ag("Grok"), "тема без стрілок", Op::Q);
         env.body = serde_json::json!({"текст": "a -> b, <!-- відкрито, 5 - 3 = 2"});
         store.post(env).unwrap();
 
@@ -1988,9 +1990,9 @@ mod tests {
 
     fn corpus_store(dir: &Path) -> Store {
         let store = Store::open(&dir.join("exchange.db")).unwrap();
-        store.lock("alpha", Agent::Grok, 90, "hold").unwrap();
+        store.lock("alpha", ag("Grok"), 90, "hold").unwrap();
         store
-            .post(sample_envelope(Agent::Claude, Agent::Grok, "alpha", Op::Q))
+            .post(sample_envelope(ag("Claude"), ag("Grok"), "alpha", Op::Q))
             .unwrap();
         store
     }
@@ -2117,10 +2119,10 @@ mod tests {
         }
 
         // База змінилась — оновитись має рівно вміст блоків.
-        store.unlock("alpha", Agent::Grok).unwrap();
-        store.lock("gamma", Agent::Claude, 4200, "новий").unwrap();
+        store.unlock("alpha", ag("Grok")).unwrap();
+        store.lock("gamma", ag("Claude"), 4200, "новий").unwrap();
         let id = store
-            .post(sample_envelope(Agent::Grok, Agent::Claude, "gamma", Op::N))
+            .post(sample_envelope(ag("Grok"), ag("Claude"), "gamma", Op::N))
             .unwrap();
 
         for (i, case) in cases.iter().enumerate() {
@@ -2310,7 +2312,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = dir.path().join("exchange.db");
         let store = Store::open(&db).unwrap();
-        store.lock("alpha", Agent::Grok, 90, "hold").unwrap();
+        store.lock("alpha", ag("Grok"), 90, "hold").unwrap();
 
         let now = dir.path().join("NOW.md");
         fs::write(&now, NOT_UTF8).unwrap();
@@ -2352,7 +2354,7 @@ mod tests {
         assert!(!now.exists());
 
         let store = Store::open(&db).unwrap();
-        store.lock("alpha", Agent::Grok, 90, "hold").unwrap();
+        store.lock("alpha", ag("Grok"), 90, "hold").unwrap();
         render(&store, &now).unwrap();
 
         let text = fs::read_to_string(&now).unwrap();
@@ -2374,9 +2376,9 @@ mod tests {
         fs::write(&now, handwritten()).unwrap();
 
         let store = Store::open(&db).unwrap();
-        store.lock("alpha", Agent::Grok, 90, "hold").unwrap();
+        store.lock("alpha", ag("Grok"), 90, "hold").unwrap();
         store
-            .post(sample_envelope(Agent::Claude, Agent::Grok, "alpha", Op::Q))
+            .post(sample_envelope(ag("Claude"), ag("Grok"), "alpha", Op::Q))
             .unwrap();
 
         render(&store, &now).unwrap();
@@ -2392,7 +2394,7 @@ mod tests {
         let expected = merge_now_md(
             Some(handwritten()),
             &build_lock_block(&store.locks().unwrap()),
-            &build_inbox_block(&store.inbox(Agent::Grok, false).unwrap()),
+            &build_inbox_block(&store.inbox(ag("Grok"), false).unwrap()),
         )
         .unwrap();
         assert_eq!(
@@ -2488,7 +2490,7 @@ mod tests {
         fs::write(&now, handwritten()).unwrap();
 
         let store = Store::open(&db).unwrap();
-        store.lock("alpha", Agent::Grok, 90, "hold").unwrap();
+        store.lock("alpha", ag("Grok"), 90, "hold").unwrap();
 
         // Чужий процес узяв замок і ще нічого не дописав.
         let held = acquire_lock_with(&now, Duration::from_millis(50), LOCK_STALE)

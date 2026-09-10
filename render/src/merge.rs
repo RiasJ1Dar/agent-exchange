@@ -1,5 +1,13 @@
 use crate::talk::TALK_NAME;
-use exchange_store::{Agent, Lock, Message, Op, Recipient};
+use exchange_store::{Lock, Message, Op, Recipient};
+
+/// Імена, під які зроблені лічильники дошки.
+///
+/// ⚠️ Тимчасове: сервер уже не знає імен, а дошка ще знає. Етап 5 замінює
+/// ці лічильники на побудовані з того, що реально є в базі.
+const GROK: &str = "Grok";
+/// Див. [`GROK`].
+const CLAUDE: &str = "Claude";
 use std::borrow::Cow;
 use std::fmt::Write as FmtWrite;
 
@@ -92,23 +100,30 @@ impl Unread {
 
 fn tally_unread(msgs: &[Message]) -> Unread {
     let mut t = Unread::default();
+    // ⚠️ Імена звіряються рядками, а не варіантами переліку: `Agent` більше
+    // не enum. Самі рядки `Grok`/`Claude` тут поки лишаються — лічильники
+    // дошки прив'язані до пари агентів, і це прибирає етап 5, а не цей.
     for m in msgs.iter().filter(|m| m.read_at.is_none()) {
-        let to = m.envelope.to;
+        let to = &m.envelope.to;
+        let all = matches!(to, Recipient::All);
+        let named = |name: &str| matches!(to, Recipient::One(a) if a.as_str() == name);
         if m.envelope.op == Op::Q {
             // Питання перебиває адресата: `Q` на всіх — це питання
             // кожному, а не широкомовний статус.
-            if matches!(to, Recipient::One(Agent::Grok) | Recipient::All) {
+            if all || named(GROK) {
                 t.q_grok += 1;
             }
-            if matches!(to, Recipient::One(Agent::Claude) | Recipient::All) {
+            if all || named(CLAUDE) {
                 t.q_claude += 1;
             }
             continue;
         }
-        match to {
-            Recipient::One(Agent::Grok) => t.personal_grok += 1,
-            Recipient::One(Agent::Claude) => t.personal_claude += 1,
-            Recipient::All => t.broadcast += 1,
+        if all {
+            t.broadcast += 1;
+        } else if named(GROK) {
+            t.personal_grok += 1;
+        } else if named(CLAUDE) {
+            t.personal_claude += 1;
         }
     }
     t
