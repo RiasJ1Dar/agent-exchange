@@ -42,10 +42,39 @@ pub const BROADCAST: &str = crate::page::BROADCAST;
 /// Історичне написання [`BROADCAST`] зі схеми v1 — див. `page`.
 pub const BROADCAST_LEGACY: &str = crate::page::BROADCAST_LEGACY;
 
-/// Агенти, для яких рахуються непрочитані.
-pub const GROK: &str = "Grok";
-/// Див. [`GROK`].
-pub const CLAUDE: &str = "Claude";
+/// Скільки непрочитаних у скриньці кожного агента, за алфавітом.
+///
+/// ⚠️ Імена беруться **з бази**, а не з переліку в коді. Раніше тут стояли
+/// дві константи `Grok`/`Claude`: сторінка мовчки не показала б третього
+/// учасника, і людина вирішила б, що його пошта десь ділась.
+///
+/// Учасник — той, хто згадується як відправник або як адресат. Широкомовна
+/// адреса учасником не є: у неї немає скриньки, тому обидва її написання
+/// відсіюються.
+fn unread_by_agent(conn: &Connection, path: &Path) -> Result<Vec<(String, usize)>, DbError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT name FROM (
+                 SELECT from_agent AS name FROM messages
+                 UNION SELECT to_agent FROM messages
+             )
+             WHERE name NOT IN (?1, ?2)
+             ORDER BY name",
+        )
+        .map_err(|e| classify(e, path, true))?;
+    let names: Vec<String> = stmt
+        .query_map([BROADCAST, BROADCAST_LEGACY], |r| r.get::<_, String>(0))
+        .map_err(|e| classify(e, path, true))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| classify(e, path, true))?;
+
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        let n = count_unread(conn, path, &name)?;
+        out.push((name, n));
+    }
+    Ok(out)
+}
 
 /// Чому не вдалось прочитати базу.
 ///
@@ -384,8 +413,7 @@ pub fn read_snapshot(db: &Path, now: i64, now_md: &Path) -> Result<Snapshot, DbE
         unread_questions: questions,
         unread_personal: personal,
         unread_broadcast: broadcast,
-        unread_grok: count_unread(&conn, db, GROK)?,
-        unread_claude: count_unread(&conn, db, CLAUDE)?,
+        unread_by_agent: unread_by_agent(&conn, db)?,
         last_render: file_mtime_unix(now_md),
     })
 }
@@ -519,8 +547,8 @@ mod tests {
         assert_eq!(snap.now, 1_000);
         assert!(snap.locks.is_empty());
         assert!(snap.messages.is_empty());
-        assert_eq!(snap.unread_grok, 0);
-        assert_eq!(snap.unread_claude, 0);
+        // Порожня база — жодного учасника: імена беруться з повідомлень.
+        assert!(snap.unread_by_agent.is_empty());
         assert_eq!(snap.unread_questions, 0);
         assert_eq!(snap.unread_personal, 0);
         assert_eq!(snap.unread_broadcast, 0);
@@ -577,10 +605,11 @@ mod tests {
             insert_msg(&w, 50, "Claude", "Grok", "t", "n", Some(51));
         }
         let snap = read_snapshot(&db, 100, &dir.join("NOW.md")).expect("снапшот");
-        // Claude: одне персональне + одне Both.
-        assert_eq!(snap.unread_claude, 2);
-        // Grok: одне персональне + те саме Both.
-        assert_eq!(snap.unread_grok, 2);
+        // Кожному: одне персональне + та сама розсилка. Порядок алфавітний.
+        assert_eq!(
+            snap.unread_by_agent,
+            vec![("Claude".to_string(), 2), ("Grok".to_string(), 2)]
+        );
         assert_eq!(snap.messages.len(), 5);
         // ⚠️ А в розрядах те саме Both рахується рівно раз: два адресні
         // «N» + одне широкомовне.
@@ -749,7 +778,9 @@ mod tests {
         // Писач закрився чисто — read-only читач мусить дати снапшот.
         let snap = read_snapshot(&db, 7, &dir.join("NOW.md")).expect("снапшот на WAL-базі");
         assert_eq!(snap.messages.len(), 1);
-        assert_eq!(snap.unread_grok, 1);
-        assert_eq!(snap.unread_claude, 1);
+        // ⚠️ Лише Grok: єдине повідомлення — його розсилка всім, і більше
+        // жодне ім'я в базі не згадується. Учасники беруться з обміну, тож
+        // Claude, якого тут ніколи не було, і не з'являється.
+        assert_eq!(snap.unread_by_agent, vec![("Grok".to_string(), 1)]);
     }
 }
