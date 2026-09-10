@@ -144,6 +144,9 @@ fn lock_inner(
     ttl_sec: i64,
     note: &str,
     notify: bool,
+    // Ключ підпису — щоб сповіщення про витіснення було підписане так само,
+    // як звичайне повідомлення. Інакше воно єдине приходило б без підпису.
+    key: Option<&crate::sign::Key>,
 ) -> Result<LockOutcome, Error> {
     let ttl_sec = clamp_ttl(ttl_sec);
     let now = now_unix();
@@ -215,6 +218,7 @@ fn lock_inner(
                         op: Op::N,
                         body,
                     },
+                    key,
                 )?);
             }
         }
@@ -246,7 +250,7 @@ impl crate::Store {
         let topic = normalize_topic(topic);
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        lock_inner(&tx, &topic, holder, ttl_sec, note, false)?;
+        lock_inner(&tx, &topic, holder, ttl_sec, note, false, self.key.as_ref())?;
         tx.commit()?;
         Ok(())
     }
@@ -274,7 +278,7 @@ impl crate::Store {
         let topic = normalize_topic(topic);
         let mut conn = self.conn()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let outcome = lock_inner(&tx, &topic, holder, ttl_sec, note, true)?;
+        let outcome = lock_inner(&tx, &topic, holder, ttl_sec, note, true, self.key.as_ref())?;
         tx.commit()?;
         Ok(outcome)
     }

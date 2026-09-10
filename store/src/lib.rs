@@ -13,7 +13,10 @@ pub use messages::{
     BROADCAST_LEGACY, GC_INTERVAL_SEC, GC_READ_TTL_SEC, MAX_AGENT_CHARS,
     MAX_BODY_CHARS,
 };
-pub use sign::{canonical, CANON_TAG, SIGNABLE_ENVELOPE_V};
+pub use sign::{
+    canonical, from_hex, to_hex, verify, Key, CANON_TAG, KEY_BYTES, SIGNABLE_ENVELOPE_V,
+    SIG_BYTES,
+};
 pub use locks::{
     normalize_topic, Evicted, Lock, LockOutcome, MAX_NOTE_CHARS, MAX_TOPIC_CHARS,
     MAX_TTL_SEC, MIN_TTL_SEC,
@@ -31,6 +34,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// Ключ, яким підписуються вихідні повідомлення. `None` — не підписувати.
+    ///
+    /// ⚠️ Читання змінних середовища тут немає навмисне: `store` не має
+    /// знати, звідки взявся ключ. Виставляє його `mcp` через
+    /// [`Store::with_key`] — там же, де читаються решта налаштувань.
+    key: Option<sign::Key>,
     /// Unix-час останнього авто-gc. `0` — ще не було: перший `post`/`ack`
     /// на цьому з'єднанні прибере прочитане старші за [`GC_READ_TTL_SEC`].
     last_gc_unix: AtomicI64,
@@ -44,6 +53,21 @@ fn now_unix() -> i64 {
 }
 
 impl Store {
+    /// Увімкнути підпис вихідних повідомлень.
+    ///
+    /// ⚠️ Впливає лише на те, що пишеться **далі**. Рядки, записані до
+    /// цього, лишаються без підпису назавжди — і це нормальний стан, а не
+    /// пошкодження: перевірка їх не відкидає, а позначає як непідписані.
+    pub fn with_key(mut self, key: Option<sign::Key>) -> Self {
+        self.key = key;
+        self
+    }
+
+    /// Чи підписує цей `Store` те, що пише.
+    pub fn signs(&self) -> bool {
+        self.key.is_some()
+    }
+
     pub(crate) fn conn(&self) -> Result<MutexGuard<'_, Connection>, Error> {
         self.conn.lock().map_err(|_| Error::Poisoned)
     }
@@ -1389,6 +1413,104 @@ mod tests {
             Recipient::parse("Both!").is_err(),
             "толерантність не мала розповзтися на схожі рядки"
         );
+    }
+
+    // ── Підпис при post ─────────────────────────────────────────────────
+
+    fn signed_store(dir: &TempDir) -> Store {
+        let path = dir.path().join("signed.db");
+        let key = Key::from_seed(&[5u8; KEY_BYTES], "claude-1").unwrap();
+        Store::open(&path).unwrap().with_key(Some(key))
+    }
+
+    fn sig_of(store: &Store, id: i64) -> (Option<String>, Option<String>) {
+        store
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT sig, key_id FROM messages WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn without_a_key_nothing_is_signed() {
+        let (_tmp, store) = tmp_store();
+        assert!(!store.signs());
+        let id = store
+            .post(env(ag("Grok"), ag("Claude"), Op::N, json!({})))
+            .unwrap();
+        assert_eq!(sig_of(&store, id), (None, None));
+    }
+
+    /// ⚠️ Головний тест зрізу: підпис має сходитись із тим `ts_unix`, який
+    /// **лежить у рядку**.
+    ///
+    /// Якби час брався двічі — окремо для підпису й окремо для `INSERT`, —
+    /// вони розходились би на межі секунди. Дефект, що спрацьовує раз на
+    /// тисячу, і виглядає як «ключ зіпсувався».
+    #[test]
+    fn a_signed_message_verifies_against_the_row_it_was_written_to() {
+        let dir = TempDir::new().unwrap();
+        let store = signed_store(&dir);
+        let key = Key::from_seed(&[5u8; KEY_BYTES], "claude-1").unwrap();
+
+        let envelope = env(ag("Grok"), ag("Claude"), Op::Q, json!({"q": "?"}));
+        let id = store.post(envelope).unwrap();
+
+        let (sig, key_id) = sig_of(&store, id);
+        let sig = sig.expect("підпис мав бути");
+        assert_eq!(key_id.as_deref(), Some("claude-1"));
+
+        // Беремо рядок так, як його прочитає перевірка: із бази.
+        let msg = store
+            .all_messages()
+            .unwrap()
+            .into_iter()
+            .find(|m| m.id == id)
+            .unwrap();
+        let canon = canonical(&msg.envelope, msg.ts_unix).unwrap();
+
+        assert!(
+            verify(&key.public_hex(), &canon, &sig),
+            "підпис не зійшовся з рядком, який записали"
+        );
+    }
+
+    /// Чужий ключ не дає підпису, який пройде перевірку нашим.
+    #[test]
+    fn a_message_signed_by_another_key_does_not_verify() {
+        let dir = TempDir::new().unwrap();
+        let store = signed_store(&dir);
+        let stranger = Key::from_seed(&[9u8; KEY_BYTES], "grok-1").unwrap();
+
+        let id = store
+            .post(env(ag("Grok"), ag("Claude"), Op::N, json!({})))
+            .unwrap();
+        let (sig, _) = sig_of(&store, id);
+
+        let msg = store.all_messages().unwrap().pop().unwrap();
+        let canon = canonical(&msg.envelope, msg.ts_unix).unwrap();
+        assert!(!verify(&stranger.public_hex(), &canon, &sig.unwrap()));
+    }
+
+    /// Сповіщення про витіснення замка теж підписується — інакше воно єдине
+    /// приходило б без підпису й виглядало б підробленим.
+    #[test]
+    fn the_eviction_notice_is_signed_too() {
+        let dir = TempDir::new().unwrap();
+        let store = signed_store(&dir);
+
+        store.lock("t", ag("Grok"), MIN_TTL_SEC, "моє").unwrap();
+        age_lock(&store, "t", MIN_TTL_SEC + 1);
+        let out = store.lock_ex("t", ag("Claude"), MIN_TTL_SEC, "перехопив").unwrap();
+
+        let notified = out.notified_id.expect("сповіщення мало бути");
+        let (sig, key_id) = sig_of(&store, notified);
+        assert!(sig.is_some(), "сповіщення лишилось без підпису");
+        assert_eq!(key_id.as_deref(), Some("claude-1"));
     }
 
     // ── Схема v3: місце під підпис ──────────────────────────────────────

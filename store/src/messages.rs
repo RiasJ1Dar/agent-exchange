@@ -358,7 +358,11 @@ fn brief_body(body: serde_json::Value, n: usize) -> serde_json::Value {
 /// `&Transaction` — він дереференсується у `Connection`), а публічний
 /// [`Store::post`] — тонка обгортка, що бере гард рівно один раз.
 /// Будь-яка майбутня композиція методів `Store` має йти цим же шляхом.
-pub(crate) fn post_with_conn(conn: &Connection, env: Envelope) -> Result<i64, Error> {
+pub(crate) fn post_with_conn(
+    conn: &Connection,
+    env: Envelope,
+    key: Option<&crate::sign::Key>,
+) -> Result<i64, Error> {
     if env.v != ENVELOPE_V {
         return Err(Error::BadVersion(env.v));
     }
@@ -381,9 +385,25 @@ pub(crate) fn post_with_conn(conn: &Connection, env: Envelope) -> Result<i64, Er
         });
     }
     let now = now_unix();
+
+    // ⚠️ Підписується той самий `now`, що лягає в рядок. Якби час брався
+    // двічі, підпис перевірявся б проти іншої секунди — і не сходився б
+    // «іноді», а це найгірший вид дефекту.
+    //
+    // Немає ключа — немає підпису, і це не збій: підпис вмикається
+    // конфігом, а без нього сервер працює як до R5.
+    let (sig, key_id) = match key {
+        Some(k) => {
+            let canon = crate::sign::canonical(&env, now)?;
+            (Some(k.sign(&canon)), Some(k.id.clone()))
+        }
+        None => (None, None),
+    };
+
     conn.execute(
-        "INSERT INTO messages (ts_unix, v, from_agent, to_agent, topic, op, body, read_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+        "INSERT INTO messages
+             (ts_unix, v, from_agent, to_agent, topic, op, body, read_at, sig, key_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9)",
         params![
             now,
             env.v,
@@ -394,7 +414,9 @@ pub(crate) fn post_with_conn(conn: &Connection, env: Envelope) -> Result<i64, Er
             env.to.as_str(),
             env.topic.as_str(),
             env.op.as_str(),
-            body
+            body,
+            sig,
+            key_id
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -446,7 +468,7 @@ impl crate::Store {
     pub fn post(&self, env: Envelope) -> Result<i64, Error> {
         let conn = self.conn.lock().map_err(|_| Error::Poisoned)?;
         maybe_gc(&self.last_gc_unix, &conn)?;
-        post_with_conn(&conn, env)
+        post_with_conn(&conn, env, self.key.as_ref())
     }
 
     /// Скринька агента: усе, що адресоване йому або всім, найстарші першими.

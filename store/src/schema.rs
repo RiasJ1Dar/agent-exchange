@@ -177,6 +177,7 @@ impl Store {
         }
         Ok(Store {
             conn: Mutex::new(conn),
+            key: None,
             // Перший post/ack на цьому з'єднанні зробить gc.
             last_gc_unix: std::sync::atomic::AtomicI64::new(0),
         })
