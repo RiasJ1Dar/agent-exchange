@@ -24,8 +24,8 @@ pub(crate) fn agent_talk_path(now_md: &Path) -> PathBuf {
 struct TalkLine<'a> {
     id: i64,
     ts: i64,
-    from: Agent,
-    to: Recipient,
+    from: &'a Agent,
+    to: &'a Recipient,
     topic: &'a str,
     op: Op,
     read: bool,
@@ -44,8 +44,8 @@ pub(crate) fn build_agent_talk(msgs: &[Message]) -> String {
         let line = TalkLine {
             id: m.id,
             ts: m.ts_unix,
-            from: m.envelope.from,
-            to: m.envelope.to,
+            from: &m.envelope.from,
+            to: &m.envelope.to,
             topic: &m.envelope.topic,
             op: m.envelope.op,
             read: m.read_at.is_some(),
