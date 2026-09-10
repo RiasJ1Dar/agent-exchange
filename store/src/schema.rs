@@ -10,7 +10,8 @@ use std::sync::Mutex;
 /// |---|---|
 /// | 1 | `messages` + `locks` + `idx_messages_inbox` — базова схема |
 /// | 2 | широкомовна адреса `Both` перейменована на `*` |
-pub const SCHEMA_VERSION: i64 = 2;
+/// | 3 | `messages.sig` і `messages.key_id` — місце під підпис |
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Один крок міграції: довести схему до версії `to`.
 ///
@@ -46,7 +47,43 @@ const MIGRATIONS: &[Migration] = &[Migration {
         )?;
         Ok(())
     },
+}, Migration {
+    to: 3,
+    apply: |conn| {
+        // Місце під підпис Ed25519. Порожнє: писати його починає наступний
+        // зріз, а тут лише з'являються колонки.
+        //
+        // ⚠️ Обидві NULL-абельні, і це не тимчасово. Підпис вмикається
+        // конфігом; без нього сервер працює як раніше, і рядки лишаються
+        // без підпису назавжди. Зробити колонки обов'язковими означало б
+        // вимагати ключів від кожного, хто просто хоче поштову скриньку.
+        add_column_if_missing(conn, "messages", "sig")?;
+        add_column_if_missing(conn, "messages", "key_id")?;
+        Ok(())
+    },
 }];
+
+/// Додати колонку, якщо її ще немає.
+///
+/// ⚠️ Перевірка обов'язкова, і не заради «про всяк випадок». Нова база
+/// створюється з повної [`SCHEMA`] — тобто вже з цими колонками, — а потім
+/// однаково проходить `migrate` з версії 0. Голий `ALTER TABLE ADD COLUMN`
+/// на ній впав би з «duplicate column name», і **жодна нова база не
+/// відкрилася б узагалі**.
+///
+/// Тип не задається: SQLite тримає колонки без строгого типу, а обидві
+/// потрібні як текст або NULL.
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str) -> Result<(), Error> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let existing = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<String>, _>>()?;
+    if existing.iter().any(|c| c == column) {
+        return Ok(());
+    }
+    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"))?;
+    Ok(())
+}
 
 fn read_user_version(conn: &Connection) -> Result<i64, Error> {
     Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
@@ -83,7 +120,11 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
     Ok(())
 }
 
-/// Базова схема версії 1: messages + locks + idx_messages_inbox.
+/// Схема **поточної** версії: `messages` + `locks` + індекс.
+///
+/// ⚠️ Тримається в актуальному вигляді, а не на версії 1: нова база
+/// створюється саме звідси. Тому кожна міграція, що додає колонку, мусить
+/// бути ідемпотентною — див. [`add_column_if_missing`].
 pub const SCHEMA: &str = r#"
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,7 +135,12 @@ pub const SCHEMA: &str = r#"
                 topic TEXT NOT NULL,
                 op TEXT NOT NULL,
                 body TEXT NOT NULL,
-                read_at INTEGER
+                read_at INTEGER,
+                -- Підпис Ed25519 у base64 і ім'я ключа, яким підписано.
+                -- NULL — рядок без підпису: так виглядають усі записи до
+                -- вмикання підпису й усі записи там, де його не вмикали.
+                sig TEXT,
+                key_id TEXT
             );
             CREATE TABLE IF NOT EXISTS locks (
                 topic TEXT PRIMARY KEY,

@@ -1389,6 +1389,72 @@ mod tests {
         );
     }
 
+    // ── Схема v3: місце під підпис ──────────────────────────────────────
+
+    fn columns_of(store: &Store, table: &str) -> Vec<String> {
+        let conn = store.conn().unwrap();
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// ⚠️ Головний тест зрізу — і він про пастку, а не про фічу.
+    ///
+    /// Нова база створюється з повної `SCHEMA`, тобто вже з колонками
+    /// підпису, а потім однаково проходить `migrate` з версії 0. Голий
+    /// `ALTER TABLE ADD COLUMN` там впав би з «duplicate column name», і
+    /// жодна нова база не відкрилася б узагалі.
+    #[test]
+    fn a_fresh_database_survives_the_column_adding_migration() {
+        let (_tmp, store) = tmp_store();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let cols = columns_of(&store, "messages");
+        assert!(cols.contains(&"sig".to_string()), "{cols:?}");
+        assert!(cols.contains(&"key_id".to_string()), "{cols:?}");
+    }
+
+    /// Стара база доростає до v3, а те, що в ній лежало, лишається на місці.
+    #[test]
+    fn an_old_database_gains_signature_columns_without_losing_rows() {
+        let dir = TempDir::new().unwrap();
+        let path = v1_db(&dir, &["Both", "Claude"]);
+
+        let store = Store::open(&path).unwrap();
+
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let cols = columns_of(&store, "messages");
+        assert!(cols.contains(&"sig".to_string()), "{cols:?}");
+        assert_eq!(message_count(&store), 2, "міграція не мала загубити рядки");
+
+        // Місце під підпис порожнє: писати його починає наступний зріз.
+        let unsigned: i64 = store
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM messages WHERE sig IS NULL AND key_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unsigned, 2, "старі рядки мали лишитись без підпису");
+    }
+
+    /// Повторне відкриття не додає колонок удруге й не збиває версію.
+    #[test]
+    fn reopening_a_migrated_database_is_a_no_op() {
+        let dir = TempDir::new().unwrap();
+        let path = v1_db(&dir, &["Claude"]);
+
+        let before = {
+            let store = Store::open(&path).unwrap();
+            columns_of(&store, "messages")
+        };
+        let store = Store::open(&path).unwrap();
+
+        assert_eq!(columns_of(&store, "messages"), before);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
     // ── Ім'я агента: довільне, але перевірене ───────────────────────────
 
     /// ⚠️ Головний тест цього зрізу: сервер більше не знає, як звуть агентів.
