@@ -1177,7 +1177,7 @@ mod tests {
         // `beta` — особисте Grokові; `gamma` на `Both` — широкомовне.
         assert!(block.contains(NO_QUESTIONS_LINE), "не тиха черга: {block}");
         assert!(
-            block.contains("особистих непрочитаних: Grok — 1, Claude — 0"),
+            block.contains("особистих непрочитаних: Claude — 0, Grok — 1"),
             "не ті числа особистих: {block}"
         );
         assert!(
@@ -1332,17 +1332,20 @@ mod tests {
 
         // `Q` на `Both` — питання обом, а не широкомовне.
         assert!(
-            block.contains("⚠️ питань без відповіді: Grok — 3, Claude — 3"),
+            // ⚠️ Лише Claude: у цьому обміні Grok не згадується ні як
+            // відправник, ні як адресат, а дошка більше не тримає переліку
+            // агентів. Раніше тут стояло «Grok — 3, Claude — 3».
+            block.contains("⚠️ питань без відповіді: Claude — 3"),
             "питання загубились: {block}"
         );
         assert!(
             block.contains("широкомовних: 10"),
             "13 замість 3 і 10: {block}"
         );
-        // `Both` ніколи не особисте.
+        // Широкомовне ніколи не особисте.
         assert!(
-            block.contains("особистих непрочитаних: Grok — 0, Claude — 0"),
-            "Both порахувалось особистим: {block}"
+            block.contains("особистих непрочитаних: Claude — 0"),
+            "широкомовне порахувалось особистим: {block}"
         );
         assert!(!block.contains(NO_QUESTIONS_LINE), "{block}");
 
@@ -1360,7 +1363,58 @@ mod tests {
         assert!(text.contains("тримаємо курс на маркери"), "{text}");
     }
 
-    /// Особисте — це конкретний адресат; `Both` без `Q` — широкомовне.
+    /// ⚠️ Головний тест етапу: дошка показує тих, хто є, а не тих, кого
+    /// знає код.
+    ///
+    /// Раніше лічильники були двома полями `q_grok`/`q_claude`, тож третій
+    /// агент просто не з'являвся б у рядку — а людина вирішила б, що його
+    /// пошта десь ділась. Тут учасників троє, і жодне з їхніх імен у коді
+    /// не згадується.
+    #[test]
+    fn the_board_counts_whoever_is_actually_in_the_exchange() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("exchange.db");
+        let now = dir.path().join("NOW.md");
+        let store = Store::open(&db).unwrap();
+
+        // Питання всім — рахується кожному учасникові.
+        store
+            .post(sample_envelope(ag("Codex"), Recipient::All, "усім", Op::Q))
+            .unwrap();
+        // Особисте третьому.
+        store
+            .post(sample_envelope(
+                ag("Codex"),
+                ag("gemini-2.5-pro"),
+                "тобі",
+                Op::N,
+            ))
+            .unwrap();
+        // Четвертий з'являється лише як відправник — і має бути на дошці
+        // з нулями, інакше його не видно взагалі.
+        store
+            .post(sample_envelope(ag("mistral"), ag("Codex"), "привіт", Op::N))
+            .unwrap();
+
+        render(&store, &now).unwrap();
+        let text = fs::read_to_string(&now).unwrap();
+        let block = &text[text.find(INBOX_BEGIN).unwrap()..text.find(INBOX_END).unwrap()];
+
+        assert!(
+            block.contains("Codex — 1, gemini-2.5-pro — 1, mistral — 1"),
+            "питання всім мало дійти до кожного учасника: {block}"
+        );
+        assert!(
+            block.contains("особистих непрочитаних: Codex — 1, gemini-2.5-pro — 1, mistral — 0"),
+            "особисті мали розкластись по адресатах: {block}"
+        );
+        assert!(
+            block.contains("широкомовних: 0"),
+            "питання всім не мало потрапити у широкомовні: {block}"
+        );
+    }
+
+    /// Особисте — це конкретний адресат; широкомовне без `Q` — розсилка.
     #[test]
     fn personal_counts_only_named_recipient() {
         let dir = tempdir().unwrap();
@@ -1394,7 +1448,7 @@ mod tests {
         let block = &text[text.find(INBOX_BEGIN).unwrap()..text.find(INBOX_END).unwrap()];
 
         assert!(
-            block.contains("особистих непрочитаних: Grok — 1, Claude — 1"),
+            block.contains("особистих непрочитаних: Claude — 1, Grok — 1"),
             "не ті числа особистих: {block}"
         );
         assert!(
@@ -1465,8 +1519,11 @@ mod tests {
         let text = fs::read_to_string(&now).unwrap();
         let block = &text[text.find(INBOX_BEGIN).unwrap()..text.find(INBOX_END).unwrap()];
         assert!(
-            block.contains("особистих непрочитаних: Grok — 0, Claude — 0"),
-            "немає нулів: {block}"
+            // Порожній обмін — жодного агента: імена беруться з повідомлень,
+            // а їх немає. Рядок лишається на місці, щоб зникла структура
+            // дошки не читалась як збій рендера.
+            block.contains("особистих непрочитаних: агентів ще немає"),
+            "немає рядка лічильників: {block}"
         );
         assert!(block.contains(NO_QUESTIONS_LINE), "{block}");
         assert!(block.contains("широкомовних: 0"), "{block}");

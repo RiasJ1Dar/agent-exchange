@@ -149,15 +149,17 @@ pub struct Snapshot {
     pub unread_personal: usize,
     /// Непрочитані широкомовні ([`UnreadKind::Broadcast`]).
     pub unread_broadcast: usize,
-    /// Скільки непрочитаних лежить у скриньці Grok.
+    /// Скільки непрочитаних у скриньці кожного агента: `(ім'я, скільки)`.
     ///
-    /// ⚠️ Це **інша** величина, ніж три лічильники вище: тут `Both`
-    /// рахується обом агентам, тож `unread_grok + unread_claude` більше за
-    /// суму розрядів і ні з чим не збігається. Саме тому воно показується
-    /// найдрібнішим рядком, а не як підсумок.
-    pub unread_grok: usize,
-    /// Див. [`Snapshot::unread_grok`].
-    pub unread_claude: usize,
+    /// ⚠️ Це **інша** величина, ніж три лічильники вище: широкомовне
+    /// рахується кожному, тож сума цих чисел більша за суму розрядів і ні з
+    /// чим не збігається. Саме тому вони показуються найдрібнішим рядком, а
+    /// не як підсумок.
+    ///
+    /// ⚠️ Список, а не два поля: імена беруться з бази. Переглядач не має
+    /// знати, як звуть агентів, — інакше третій учасник просто не з'явився б
+    /// на сторінці, і людина вирішила б, що його пошта десь ділась.
+    pub unread_by_agent: Vec<(String, usize)>,
     /// Коли востаннє робився `render`. `None` — не робився жодного разу.
     pub last_render: Option<i64>,
 }
@@ -362,9 +364,18 @@ fn push_unread(h: &mut String, s: &Snapshot) {
     // ⚠️ Спільного підсумку тут немає навмисне. Одне велике число і є те, від
     // чого пішов цей зріз: воно однакове і для сорока статусів, і для сорока
     // питань, тобто не каже нічого. Три числа вище вже його заміняють.
+    let by_agent = if s.unread_by_agent.is_empty() {
+        "агентів ще немає".to_string()
+    } else {
+        s.unread_by_agent
+            .iter()
+            // ⚠️ Ім'я з бази — через `escape`: його пише інший агент.
+            .map(|(name, n)| format!("{} {n}", escape(name)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     h.push_str(&format!(
-        "<p class=\"sub\">По скриньках, Both рахується обом: Grok {}, Claude {}.</p>\n",
-        s.unread_grok, s.unread_claude
+        "<p class=\"sub\">По скриньках, широкомовне рахується кожному: {by_agent}.</p>\n"
     ));
 
     if s.unread_total() == 0 {
@@ -501,8 +512,7 @@ mod tests {
             unread_questions: 2,
             unread_personal: 9,
             unread_broadcast: 30,
-            unread_grok: 31,
-            unread_claude: 41,
+            unread_by_agent: vec![("Grok".into(), 31), ("Claude".into(), 41)],
             last_render: Some(NOW - 300),
         }
     }
@@ -616,8 +626,7 @@ mod tests {
             unread_personal: 8,
             unread_broadcast: 30,
             // По скриньках навмисне інші числа: вони рахують Both двічі.
-            unread_grok: 33,
-            unread_claude: 38,
+            unread_by_agent: vec![("Grok".into(), 33), ("Claude".into(), 38)],
             ..Snapshot::default()
         };
         let block = unread_block(&render_page(&s));
@@ -658,8 +667,7 @@ mod tests {
             unread_questions: 0,
             unread_personal: 4,
             unread_broadcast: 37,
-            unread_grok: 20,
-            unread_claude: 21,
+            unread_by_agent: vec![("Grok".into(), 20), ("Claude".into(), 21)],
             ..Snapshot::default()
         };
         let block = unread_block(&render_page(&s));
