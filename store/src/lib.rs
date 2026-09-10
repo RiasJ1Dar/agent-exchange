@@ -4,6 +4,7 @@ mod error;
 mod schema;
 mod messages;
 mod locks;
+mod sign;
 
 pub use error::Error;
 pub use schema::{SCHEMA, SCHEMA_VERSION};
@@ -12,6 +13,7 @@ pub use messages::{
     BROADCAST_LEGACY, GC_INTERVAL_SEC, GC_READ_TTL_SEC, MAX_AGENT_CHARS,
     MAX_BODY_CHARS,
 };
+pub use sign::{canonical, CANON_TAG, SIGNABLE_ENVELOPE_V};
 pub use locks::{
     normalize_topic, Evicted, Lock, LockOutcome, MAX_NOTE_CHARS, MAX_TOPIC_CHARS,
     MAX_TTL_SEC, MIN_TTL_SEC,
