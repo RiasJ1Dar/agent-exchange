@@ -45,6 +45,23 @@ fn main() {
         return;
     }
 
+    // ⚠️ Окрема дія, а не режим сервера — і саме тому **до** `parse_args`.
+    //
+    // Розбір аргументів не знає цього прапорця й відповів би підказкою;
+    // спершу я так і зробив, і `--pubkey` мовчки друкував usage.
+    //
+    // Без цієї дії публічний ключ нема звідки взяти, а саме його віддають
+    // іншому агентові для `EXCHANGE_AGENTS`.
+    if args.iter().any(|a| a == "--pubkey") {
+        match print_public_key() {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("exchange-mcp: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     let env_port = std::env::var(UI_PORT_ENV).ok();
     let ui = match parse_args(&args, env_port.as_deref()) {
         Ok(cfg) => cfg,
@@ -66,6 +83,30 @@ fn main() {
     }
 }
 
+/// Надрукувати публічний ключ, що відповідає `EXCHANGE_KEY`.
+///
+/// ⚠️ У вивід іде **лише публічний** ключ. Приватний не друкується ніде й
+/// ніколи: його єдине місце — файл, на який вказує змінна.
+fn print_public_key() -> Result<(), String> {
+    let path = std::env::var(exchange_mcp::KEY_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "--pubkey потребує {}: шлях до файла з приватним ключем",
+                exchange_mcp::KEY_ENV
+            )
+        })?;
+    let id = std::env::var(exchange_mcp::KEY_ID_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    let key = exchange_store::Key::from_file(std::path::Path::new(path.trim()), id.trim())
+        .map_err(|e| e.to_string())?;
+    println!("{}", key.public_hex());
+    Ok(())
+}
+
 /// Підказка про запуск.
 fn usage() -> String {
     format!(
@@ -76,6 +117,7 @@ fn usage() -> String {
          \n\
          --no-ui        не піднімати сторінку\n\
          --ui-port N    порт сторінки, за замовчуванням {DEFAULT_UI_PORT}\n\
+         --pubkey       надрукувати публічний ключ із {key_env} і вийти\n\
          -h, --help     ця підказка\n\
          \n\
          Змінні середовища:\n\
@@ -84,6 +126,7 @@ fn usage() -> String {
          {now_env}    шлях до NOW.md, за замовчуванням {now}\n\
          \n\
          Порт зайнятий — сервер працює далі без сторінки: обмін важливіший.",
+        key_env = exchange_mcp::KEY_ENV,
         db_env = exchange_mcp::DB_ENV,
         now_env = exchange_mcp::NOW_MD_ENV,
         db = exchange_mcp::PROD_DB,
