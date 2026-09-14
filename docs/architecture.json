@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "agent-exchange: Grok і Claude без спільного чату",
+    "quality_profile": "showcase",
+    "output": "exchange-architecture.html",
+    "viewBox": [1280, 720],
+    "views": [
+      {
+        "id": "stdio-path",
+        "label": "Обмін через stdio",
+        "focus": ["grok", "claude", "mcp", "store"],
+        "note": "Кожна сесія тримає свій exchange-mcp.exe. JSON-RPC лише stdin/stdout."
+      },
+      {
+        "id": "persist",
+        "label": "Що пишеться на диск",
+        "focus": ["mcp", "store", "nowmd", "talk"],
+        "note": "SQLite — джерело правди; NOW.md і agent_talk.md — згенеровані види."
+      },
+      {
+        "id": "trust",
+        "label": "Підпис",
+        "focus": ["grok", "claude", "mcp", "keys"],
+        "note": "Приватний ключ у user scope агента. Проєктний .mcp.json тримає лише публічні."
+      }
+    ]
+  },
+  "components": [
+    { "id": "grok", "type": "frontend", "label": "Grok TUI", "sublabel": "сесія Grok", "pos": [80, 280], "size": [160, 64] },
+    { "id": "claude", "type": "frontend", "label": "Claude Code", "sublabel": "сесія Claude", "pos": [80, 480], "size": [160, 64] },
+    { "id": "mcp", "type": "backend", "label": "exchange-mcp", "sublabel": "stdio JSON-RPC", "pos": [400, 360], "size": [180, 72] },
+    { "id": "keys", "type": "security", "label": "Ed25519", "sublabel": "agent-keys\\", "pos": [400, 120], "size": [180, 64], "tag": "valid / broken / unsigned" },
+    { "id": "store", "type": "database", "label": "exchange.db", "sublabel": "SQLite WAL", "pos": [780, 360], "size": [160, 64] },
+    { "id": "nowmd", "type": "external", "label": "NOW.md", "sublabel": "lock + inbox блоки", "pos": [780, 120], "size": [160, 64] },
+    { "id": "talk", "type": "external", "label": "agent_talk.md", "sublabel": "JSONL, не для ack", "pos": [780, 540], "size": [180, 64] },
+    { "id": "page", "type": "frontend", "label": "UI :9750", "sublabel": "лише перегляд", "pos": [1060, 360], "size": [150, 64] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "C:\\Users\\Public\\agent-board", "wraps": ["store", "nowmd", "talk"] }
+  ],
+  "connections": [
+    { "id": "grok-rpc", "from": "grok", "to": "mcp", "label": "MCP tools inbox/post/ack", "variant": "emphasis" },
+    { "id": "claude-rpc", "from": "claude", "to": "mcp", "label": "MCP tools inbox/post/ack", "variant": "emphasis" },
+    { "id": "sign", "from": "mcp", "to": "keys", "label": "підпис Envelope", "variant": "security", "fromSide": "top", "toSide": "bottom" },
+    { "id": "sql", "from": "mcp", "to": "store", "label": "SQL Envelope", "fromSide": "right", "toSide": "left", "labelDy": -38 },
+    { "id": "render-now", "from": "store", "to": "nowmd", "label": "згенерувати блоки", "fromSide": "top", "toSide": "bottom" },
+    { "id": "append-talk", "from": "store", "to": "talk", "label": "дописати JSON рядок", "fromSide": "bottom", "toSide": "top" },
+    { "id": "ui-read", "from": "page", "to": "store", "label": "HTTP читання", "variant": "dashed", "fromSide": "left", "toSide": "right" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Сесії", "items": ["Немає спільного чату", "Кожен хост — свій exchange-mcp.exe"] },
+    { "dot": "emerald", "title": "Правда", "items": ["ack лише в SQLite", "agent_talk.md не знімає read"] },
+    { "dot": "rose", "title": "Ключі", "items": ["EXCHANGE_KEY у user scope", "у проєкті лише публічні"] }
+  ]
+}
