@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "agent-exchange: Grok і Claude без спільного чату",
+    "output": "docs/architecture.html",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/RiasJ1Dar/agent-exchange.git",
+      "provider": "github",
+      "link_mode": "web",
+      "revision": "414c154d010300394bd2e9cace1b5be174469d6e"
+    },
+    "views": [
+      {
+        "id": "stdio-path",
+        "label": "Обмін через stdio",
+        "focus": ["grok", "claude", "mcp", "store"],
+        "note": "Кожна сесія тримає свій exchange-mcp. JSON-RPC лише stdin/stdout."
+      },
+      {
+        "id": "persist",
+        "label": "Що пишеться на диск",
+        "focus": ["mcp", "store", "nowmd", "talk"],
+        "note": "SQLite — джерело правди; NOW.md і agent_talk.md — згенеровані види."
+      },
+      {
+        "id": "trust",
+        "label": "Підпис",
+        "focus": ["grok", "claude", "mcp", "keys"],
+        "note": "Приватний ключ у user scope агента. Проєктний .mcp.json тримає лише публічні."
+      }
+    ]
+  },
+  "layout": {
+    "mode": "grid",
+    "origin": [40, 40],
+    "cols": 5,
+    "cellW": 125,
+    "cellH": 70,
+    "gapX": 70,
+    "gapY": 95
+  },
+  "components": [
+    {
+      "id": "keys", "type": "security", "label": "Ed25519", "sublabel": "ключ у user scope",
+      "row": 0, "col": 2,
+      "sources": [
+        { "path": "store/src/sign.rs", "line": 110, "end_line": 130, "label": "SigningKey" },
+        { "path": "store/src/sign.rs", "line": 163, "end_line": 190, "label": "sign і verify" }
+      ]
+    },
+    {
+      "id": "nowmd", "type": "external", "label": "NOW.md", "sublabel": "lock і inbox",
+      "row": 0, "col": 3,
+      "sources": [
+        { "path": "render/src/lib.rs", "line": 55, "end_line": 61, "label": "render_now" },
+        { "path": "render/src/lib.rs", "line": 78, "end_line": 98, "label": "запис під замком" }
+      ]
+    },
+    {
+      "id": "grok", "type": "frontend", "label": "Grok TUI", "sublabel": "сесія Grok",
+      "row": 1, "col": 0,
+      "sources": [
+        { "path": "README.md", "line": 3, "end_line": 4, "label": "сесій не видно" },
+        { "path": ".mcp.json.example", "line": 1, "end_line": 10, "label": "підключення сесії" }
+      ]
+    },
+    {
+      "id": "mcp", "type": "backend", "label": "exchange-mcp", "sublabel": "stdio JSON-RPC",
+      "row": 1, "col": 2,
+      "sources": [
+        { "path": "mcp/src/main.rs", "line": 1, "end_line": 6, "label": "stdout = протокол" },
+        { "path": "mcp/src/tools.rs", "line": 40, "end_line": 106, "label": "диспетчер інструментів" },
+        { "path": "mcp/src/main.rs", "line": 258, "end_line": 266, "label": "підйом UI" }
+      ]
+    },
+    {
+      "id": "store", "type": "database", "label": "exchange.db", "sublabel": "SQLite WAL",
+      "row": 1, "col": 3,
+      "sources": [
+        { "path": "store/src/schema.rs", "line": 160, "label": "journal_mode=WAL" },
+        { "path": "store/src/schema.rs", "line": 117, "end_line": 118, "label": "user_version" },
+        { "path": "store/src/lib.rs", "line": 35, "label": "Store" }
+      ]
+    },
+    {
+      "id": "page", "type": "frontend", "label": "UI :9750", "sublabel": "лише перегляд",
+      "row": 1, "col": 4,
+      "sources": [
+        { "path": "ui/src/main.rs", "line": 19, "end_line": 47, "label": "лише localhost" },
+        { "path": "ui/src/http.rs", "line": 324, "label": "serve" }
+      ]
+    },
+    {
+      "id": "claude", "type": "frontend", "label": "Claude Code", "sublabel": "сесія Claude",
+      "row": 2, "col": 0,
+      "sources": [
+        { "path": "README.md", "line": 11, "end_line": 14, "label": "дві проблеми" },
+        { "path": ".mcp.json.example", "line": 5, "end_line": 7, "label": "AGENT_NAME" }
+      ]
+    },
+    {
+      "id": "talk", "type": "external", "label": "agent_talk.md", "sublabel": "JSONL, не для ack",
+      "row": 2, "col": 3,
+      "sources": [
+        { "path": "render/src/talk.rs", "line": 6, "end_line": 18, "label": "сусід NOW.md" },
+        { "path": "render/src/talk.rs", "line": 20, "end_line": 30, "label": "порядок полів" }
+      ]
+    }
+  ],
+  "connections": [
+    { "id": "grok-rpc", "from": "grok", "to": "mcp", "label": "inbox / post / ack", "variant": "emphasis" },
+    { "id": "claude-rpc", "from": "claude", "to": "mcp", "label": "inbox / post / ack", "variant": "emphasis" },
+    { "id": "sign", "from": "mcp", "to": "keys", "label": "підпис Envelope", "variant": "security", "fromSide": "top", "toSide": "bottom" },
+    { "id": "sql", "from": "mcp", "to": "store", "label": "SQL", "variant": "emphasis" },
+    { "id": "render-now", "from": "store", "to": "nowmd", "label": "блоки", "fromSide": "top", "toSide": "bottom" },
+    { "id": "append-talk", "from": "store", "to": "talk", "label": "JSON-рядок", "fromSide": "bottom", "toSide": "top" },
+    { "id": "ui-read", "from": "page", "to": "store", "label": "читає", "variant": "dashed" }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Сесії",
+      "items": [
+        "Спільного чату немає: агенти не бачать сесій одне одного",
+        "Кожен хост тримає власний exchange-mcp",
+        "stdout — канал протоколу MCP; усе людське йде в stderr"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Де правда",
+      "items": [
+        "ack живе лише в SQLite; непрочитане переживає перезапуск сесії",
+        "NOW.md і agent_talk.md — згенеровані види, правки руками зникнуть",
+        "agent_talk.md не знімає read"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Ключі й доступ",
+      "items": [
+        "Приватний ключ у user scope агента, у проєкті лише публічні",
+        "Вікно слухає тільки 127.0.0.1 і працює на читання",
+        "Замки на теми показують зайняту тему до конфлікту злиття"
+      ]
+    }
+  ]
+}

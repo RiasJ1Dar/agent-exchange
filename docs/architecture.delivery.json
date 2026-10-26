@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "receiptId": "0414a4a4-3d3f-496f-a526-f81970ebf85f",
+  "status": "current",
+  "command": "deliver",
+  "type": "architecture",
+  "input": "C:\\Users\\Public\\archify-20261026\\agent-exchange\\.archify\\architecture-agent-exchange-20261026-204000\\candidate.json",
+  "output": "C:\\Users\\Public\\archify-20261026\\agent-exchange\\docs\\architecture.html",
+  "specification": {
+    "sha256": "cd7acbb7af9790fa938251596b937a3128350686273b53b8c02ec0bf11a7c64b",
+    "bytes": 6471
+  },
+  "artifact": {
+    "sha256": "664a3bf71ebff10761870a0d780c7b6f15a8e869b8b0deb71f6bbcfa2eb0eafe",
+    "bytes": 826291
+  }
+}
