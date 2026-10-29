@@ -12,3 +12,12 @@
 # Локальна реєстрація MCP: абсолютні шляхи й імʼя користувача.
 # Зразок для інших машин класти окремо, як .mcp.json.example
 .mcp.json
+
+# Квитанції archify містять абсолютні локальні шляхи: у git лише HTML і candidate.json
+*.finalize.json
+*.finalize-summary.json
+*.delivery.json
+*.browser-check.json
+*.visual-check.*
+review-*/
+visual-check/

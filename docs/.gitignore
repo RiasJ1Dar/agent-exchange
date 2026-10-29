@@ -1,0 +1,8 @@
+# Квитанції archify містять абсолютні локальні шляхи: у git лише HTML і candidate.json
+*.finalize.json
+*.finalize-summary.json
+*.delivery.json
+*.browser-check.json
+*.visual-check.*
+review-*/
+visual-check/
